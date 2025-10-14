@@ -11,13 +11,13 @@ import (
 
 type transport struct {
 	name   string
-	conn   PacketConn
+	conn   net.PacketConn
 	seen   sync.Map
 	mu     sync.RWMutex
 	cipher Cipher
 }
 
-func newTransport(name string, conn PacketConn, cipher Cipher) *transport {
+func newTransport(name string, conn net.PacketConn, cipher Cipher) *transport {
 	return &transport{name: name, conn: conn, cipher: cipher}
 }
 

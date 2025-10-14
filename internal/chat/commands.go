@@ -59,14 +59,10 @@ func (c *Chat) handleCommand(cmd string) error {
 			c.emitSystem("usage: /peer <address> [address...]")
 			return nil
 		}
-		if c.network == nil {
-			c.emitSystem("cannot add peers: network unavailable")
-			return nil
-		}
 
 		contacted := 0
 		for _, raw := range parts[1:] {
-			addr, err := c.network.Resolve(raw)
+			addr, err := c.resolveAddr(raw)
 			if err != nil {
 				c.emitSystem("failed to resolve %s: %v", raw, err)
 				continue
@@ -134,7 +130,7 @@ func (c *Chat) switchConfig(name string) error {
 
 	resolved := make([]net.Addr, 0, len(cfg.Peers))
 	for _, peer := range cfg.Peers {
-		addr, err := c.network.Resolve(peer)
+		addr, err := c.resolveAddr(peer)
 		if err != nil {
 			c.emitSystem("config %q skipping %s: %v", trimmed, peer, err)
 			continue

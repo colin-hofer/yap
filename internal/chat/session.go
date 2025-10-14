@@ -16,7 +16,8 @@ import (
 // Options describe how to initialise a chat session.
 type Options struct {
 	Config  config.Config
-	Network Network
+	Listen  func(string) (net.PacketConn, error)
+	Resolve func(string) (net.Addr, error)
 	Cipher  Cipher
 	Store   config.Store
 }
@@ -24,7 +25,6 @@ type Options struct {
 // Chat manages the gossip loop, user interaction, and graceful shutdown.
 type Chat struct {
 	cfg          config.Config
-	network      Network
 	bootstrap    []net.Addr
 	store        config.Store
 	transport    *transport
@@ -37,17 +37,28 @@ type Chat struct {
 	members      *membership.Manager
 	addrMu       sync.RWMutex
 	addresses    map[string]net.Addr
+	resolve      func(string) (net.Addr, error)
 }
 
 // NewChat creates a new chat session.
 func NewChat(opts Options) (*Chat, error) {
-	if opts.Network == nil {
-		return nil, errors.New("network is required")
-	}
-
 	cfg := config.Normalize(opts.Config)
 
-	conn, err := opts.Network.Listen(cfg.Listen)
+	listen := opts.Listen
+	if listen == nil {
+		listen = func(addr string) (net.PacketConn, error) {
+			return net.ListenPacket("udp", addr)
+		}
+	}
+
+	resolve := opts.Resolve
+	if resolve == nil {
+		resolve = func(target string) (net.Addr, error) {
+			return net.ResolveUDPAddr("udp", target)
+		}
+	}
+
+	conn, err := listen(cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %q: %w", cfg.Listen, err)
 	}
@@ -59,7 +70,6 @@ func NewChat(opts Options) (*Chat, error) {
 
 	session := &Chat{
 		cfg:       cfg,
-		network:   opts.Network,
 		bootstrap: make([]net.Addr, 0, len(cfg.Peers)),
 		store:     opts.Store,
 		transport: newTransport(cfg.Name, conn, opts.Cipher),
@@ -67,10 +77,11 @@ func NewChat(opts Options) (*Chat, error) {
 		events:    make(chan Message, 128),
 		members:   membership.New(localAddr, cfg.Name),
 		addresses: make(map[string]net.Addr),
+		resolve:   resolve,
 	}
 
 	for _, seed := range cfg.Peers {
-		addr, err := opts.Network.Resolve(seed)
+		addr, err := session.resolve(seed)
 		if err != nil {
 			session.transport.Close()
 			return nil, fmt.Errorf("resolve peer %q: %w", seed, err)
@@ -231,7 +242,7 @@ func (c *Chat) buildJoinPayload() string {
 
 func (c *Chat) contactPeer(addr string) {
 	addr = strings.TrimSpace(addr)
-	if addr == "" || c.network == nil {
+	if addr == "" {
 		return
 	}
 	if c.members != nil {
@@ -240,7 +251,7 @@ func (c *Chat) contactPeer(addr string) {
 		}
 		c.members.AddPending(addr)
 	}
-	resolved, err := c.network.Resolve(addr)
+	resolved, err := c.resolveAddr(addr)
 	if err != nil {
 		c.emitSystem("peer hint %s failed: %v", addr, err)
 		return
@@ -275,6 +286,17 @@ func (c *Chat) handlePeersPayload(body string, source net.Addr) {
 	for _, target := range additional {
 		c.contactPeer(target)
 	}
+}
+
+func (c *Chat) resolveAddr(raw string) (net.Addr, error) {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return nil, fmt.Errorf("address cannot be empty")
+	}
+	if c.resolve != nil {
+		return c.resolve(target)
+	}
+	return net.ResolveUDPAddr("udp", target)
 }
 
 func (c *Chat) sendDirect(addr net.Addr, kind msgType, body string) error {

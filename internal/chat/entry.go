@@ -20,10 +20,9 @@ func Run(resolved config.Config, store config.Store) error {
 	}
 
 	session, err := NewChat(Options{
-		Config:  resolved,
-		Network: UDPNetwork{},
-		Cipher:  cipher,
-		Store:   store,
+		Config: resolved,
+		Cipher: cipher,
+		Store:  store,
 	})
 	if err != nil {
 		return err
