@@ -4,40 +4,39 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"sort"
 	"strings"
 	"sync"
+
+	"yap/internal/config"
+	"yap/internal/membership"
 )
 
 // Options describe how to initialise a chat session.
 type Options struct {
-	Name    string
-	Listen  string
-	Secret  string
-	Peers   []string
+	Config  config.Config
 	Network Network
 	Cipher  Cipher
-	Config  ConfigStore
+	Store   config.Store
 }
 
 // Chat manages the gossip loop, user interaction, and graceful shutdown.
 type Chat struct {
-	name         string
-	listenAddr   string
-	secret       string
-	conn         PacketConn
+	cfg          config.Config
 	network      Network
-	peers        *PeerManager
 	bootstrap    []net.Addr
-	seen         sync.Map
-	cipher       Cipher
-	config       ConfigStore
+	store        config.Store
+	transport    *transport
 	closed       chan struct{}
 	shutdownOnce sync.Once
 	startOnce    sync.Once
 	events       chan Message
 	statusMu     sync.RWMutex
-	pending      map[string]net.Addr
 	lastEvent    string
+	members      *membership.Manager
+	addrMu       sync.RWMutex
+	addresses    map[string]net.Addr
 }
 
 // NewChat creates a new chat session.
@@ -46,41 +45,45 @@ func NewChat(opts Options) (*Chat, error) {
 		return nil, errors.New("network is required")
 	}
 
-	conn, err := opts.Network.Listen(opts.Listen)
+	cfg := config.Normalize(opts.Config)
+
+	conn, err := opts.Network.Listen(cfg.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("listen on %q: %w", opts.Listen, err)
+		return nil, fmt.Errorf("listen on %q: %w", cfg.Listen, err)
+	}
+
+	localAddr := ""
+	if conn.LocalAddr() != nil {
+		localAddr = conn.LocalAddr().String()
 	}
 
 	session := &Chat{
-		name:       opts.Name,
-		listenAddr: opts.Listen,
-		secret:     opts.Secret,
-		conn:       conn,
-		network:    opts.Network,
-		peers:      newPeerManager(),
-		bootstrap:  make([]net.Addr, 0, len(opts.Peers)),
-		cipher:     opts.Cipher,
-		config:     opts.Config,
-		closed:     make(chan struct{}),
-		events:     make(chan Message, 128),
-		pending:    make(map[string]net.Addr),
+		cfg:       cfg,
+		network:   opts.Network,
+		bootstrap: make([]net.Addr, 0, len(cfg.Peers)),
+		store:     opts.Store,
+		transport: newTransport(cfg.Name, conn, opts.Cipher),
+		closed:    make(chan struct{}),
+		events:    make(chan Message, 128),
+		members:   membership.New(localAddr, cfg.Name),
+		addresses: make(map[string]net.Addr),
 	}
 
-	for _, seed := range opts.Peers {
+	for _, seed := range cfg.Peers {
 		addr, err := opts.Network.Resolve(seed)
 		if err != nil {
-			conn.Close()
+			session.transport.Close()
 			return nil, fmt.Errorf("resolve peer %q: %w", seed, err)
 		}
 		session.bootstrap = append(session.bootstrap, addr)
 		session.markPending(addr)
 	}
 
-	session.emit(Message{Type: systemMsg, Body: fmt.Sprintf("listening on %s as %s", conn.LocalAddr(), opts.Name)})
-	if len(opts.Peers) == 0 {
+	session.emit(Message{Type: systemMsg, Body: fmt.Sprintf("listening on %s as %s", session.transport.LocalAddr(), cfg.Name)})
+	if len(cfg.Peers) == 0 {
 		session.emit(Message{Type: systemMsg, Body: "no peers provided, waiting for someone to connect"})
 	}
-	if opts.Cipher != nil {
+	if session.transport.EncryptionEnabled() {
 		session.emit(Message{Type: systemMsg, Body: "encryption enabled"})
 	}
 	session.recordEvent("session ready")
@@ -95,19 +98,21 @@ func (c *Chat) Events() <-chan Message {
 // Start starts the chat application - it is idempotent.
 func (c *Chat) Start() {
 	c.startOnce.Do(func() {
-		go c.listen()
+		c.transport.Listen(c.closed, c.handleIncoming, c.handleAuthReject, c.emitSystem)
 		sentDirect := false
+		joinPayload := c.buildJoinPayload()
 		for _, addr := range c.bootstrap {
-			if err := c.sendDirect(addr, joinMsg, ""); err != nil {
+			c.markPending(addr)
+			if err := c.sendDirect(addr, joinMsg, joinPayload); err != nil {
 				c.emitSystem("bootstrap to %s failed: %v", addr, err)
 				_ = c.dropPeer(addr, fmt.Sprintf("failed: %v", err))
 				continue
 			}
-			c.markActive(addr)
+			c.markActive(addr, "")
 			sentDirect = true
 		}
 		if !sentDirect {
-			if err := c.broadcast(joinMsg, ""); err != nil {
+			if err := c.broadcast(joinMsg, joinPayload); err != nil {
 				c.emitSystem("failed to announce presence: %v", err)
 			}
 		}
@@ -148,5 +153,232 @@ func (c *Chat) Close() error {
 	default:
 		close(c.closed)
 	}
-	return c.conn.Close()
+	return c.transport.Close()
+}
+
+func (c *Chat) handleIncoming(msg Message, addr net.Addr, raw []byte, authenticated bool) {
+	suppressEmit := false
+	activated := false
+
+	switch msg.Type {
+	case peersMsg:
+		c.handlePeersPayload(msg.Body, addr)
+		return
+	case joinMsg:
+		payload := strings.TrimSpace(msg.Body)
+		if c.members != nil && payload != "" {
+			response, additional, err := c.members.HandleJoin([]byte(payload), addr.String(), msg.From)
+			if err == nil {
+				if len(response) > 0 {
+					if err := c.sendDirect(addr, peersMsg, string(response)); err != nil {
+						c.emitSystem("failed to share peers with %s: %v", addr, err)
+					}
+				}
+				for _, target := range additional {
+					c.contactPeer(target)
+				}
+			}
+		}
+		if payload != "" {
+			suppressEmit = true
+		}
+	}
+
+	if msg.Type == errorMsg {
+		_ = c.dropPeer(addr, msg.Body)
+		c.emit(msg)
+		return
+	}
+
+	if authenticated {
+		if msg.Type == leaveMsg && msg.From != "" {
+			_ = c.dropPeer(addr, "left the chat")
+		} else {
+			activated = c.markActive(addr, msg.From)
+		}
+	}
+
+	if msg.Type == joinMsg && activated {
+		joinCopy := msg
+		joinCopy.Body = ""
+		joinCopy.Cipher = ""
+		joinCopy.Nonce = ""
+		c.emit(joinCopy)
+		suppressEmit = true
+	}
+
+	if !suppressEmit {
+		c.emit(msg)
+	}
+	c.forwardRaw(raw, addr)
+}
+
+func (c *Chat) handleAuthReject(msg Message, addr net.Addr) {
+	c.emit(msg)
+	_ = c.dropPeer(addr, msg.Body)
+}
+
+func (c *Chat) buildJoinPayload() string {
+	if c.members == nil {
+		return ""
+	}
+	data, err := c.members.BuildJoinPayload()
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func (c *Chat) contactPeer(addr string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" || c.network == nil {
+		return
+	}
+	if c.members != nil {
+		if c.members.IsLocal(addr) || c.members.Has(addr) {
+			return
+		}
+		c.members.AddPending(addr)
+	}
+	resolved, err := c.network.Resolve(addr)
+	if err != nil {
+		c.emitSystem("peer hint %s failed: %v", addr, err)
+		return
+	}
+	if c.members != nil && c.members.IsLocal(resolved.String()) {
+		return
+	}
+	if c.hasAddress(resolved) {
+		return
+	}
+	joinPayload := c.buildJoinPayload()
+	c.markPending(resolved)
+	c.rememberAddr(resolved)
+	if err := c.sendDirect(resolved, joinMsg, joinPayload); err != nil {
+		c.emitSystem("failed to reach %s: %v", resolved, err)
+		_ = c.dropPeer(resolved, fmt.Sprintf("failed: %v", err))
+	}
+}
+
+func (c *Chat) handlePeersPayload(body string, source net.Addr) {
+	if c.members == nil || strings.TrimSpace(body) == "" {
+		return
+	}
+	addrStr := ""
+	if source != nil {
+		addrStr = source.String()
+	}
+	additional, err := c.members.HandlePeers([]byte(body), addrStr)
+	if err != nil {
+		return
+	}
+	for _, target := range additional {
+		c.contactPeer(target)
+	}
+}
+
+func (c *Chat) sendDirect(addr net.Addr, kind msgType, body string) error {
+	_, raw, err := c.transport.prepare(c.cfg.Name, kind, body)
+	if err != nil {
+		return err
+	}
+	return c.transport.sendRaw(addr, raw)
+}
+
+func (c *Chat) broadcast(kind msgType, body string) error {
+	msg, raw, err := c.transport.prepare(c.cfg.Name, kind, body)
+	if err != nil {
+		return err
+	}
+
+	if kind == chatMsg {
+		local := msg
+		local.Body = body
+		local.Cipher = ""
+		local.Nonce = ""
+		c.emit(local)
+	}
+
+	c.forwardRaw(raw, nil)
+	return nil
+}
+
+func (c *Chat) forwardRaw(data []byte, exclude net.Addr) {
+	excludeKey := canonicalNetAddr(exclude)
+	c.addrMu.RLock()
+	defer c.addrMu.RUnlock()
+	for key, addr := range c.addresses {
+		if excludeKey != "" && key == excludeKey {
+			continue
+		}
+		if err := c.transport.sendRaw(addr, data); err != nil {
+			c.emitSystem("send to %s failed: %v", key, err)
+		}
+	}
+}
+
+func (c *Chat) rememberAddr(addr net.Addr) (string, bool) {
+	key := canonicalNetAddr(addr)
+	if key == "" {
+		return "", false
+	}
+	c.addrMu.Lock()
+	_, existed := c.addresses[key]
+	c.addresses[key] = addr
+	c.addrMu.Unlock()
+	return key, !existed
+}
+
+func (c *Chat) forgetAddr(addr net.Addr) bool {
+	key := canonicalNetAddr(addr)
+	if key == "" {
+		return false
+	}
+	c.addrMu.Lock()
+	_, existed := c.addresses[key]
+	if existed {
+		delete(c.addresses, key)
+	}
+	c.addrMu.Unlock()
+	return existed
+}
+
+func (c *Chat) addressKeys() []string {
+	c.addrMu.RLock()
+	defer c.addrMu.RUnlock()
+	keys := make([]string, 0, len(c.addresses))
+	for key := range c.addresses {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func canonicalNetAddr(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return canonicalAddrString(addr.String())
+}
+
+func (c *Chat) hasAddress(addr net.Addr) bool {
+	key := canonicalNetAddr(addr)
+	if key == "" {
+		return false
+	}
+	c.addrMu.RLock()
+	defer c.addrMu.RUnlock()
+	_, ok := c.addresses[key]
+	return ok
+}
+
+func canonicalAddrString(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	if ap, err := netip.ParseAddrPort(addr); err == nil {
+		return ap.String()
+	}
+	return addr
 }

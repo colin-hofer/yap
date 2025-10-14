@@ -3,18 +3,16 @@ package chat
 import (
 	"errors"
 	"fmt"
+
+	"yap/internal/config"
 )
 
 var ErrQuit = errors.New("quit")
 
-func Run(args []string) error {
-	resolved, store, err := ResolveArgs(args)
-	if err != nil {
-		return err
-	}
-
+func Run(resolved config.Config, store config.Store) error {
 	var cipher Cipher
 	if resolved.Secret != "" {
+		var err error
 		cipher, err = NewAESCipher(resolved.Secret)
 		if err != nil {
 			return fmt.Errorf("setup error: %w", err)
@@ -22,13 +20,10 @@ func Run(args []string) error {
 	}
 
 	session, err := NewChat(Options{
-		Name:    resolved.Name,
-		Listen:  resolved.Listen,
-		Secret:  resolved.Secret,
-		Peers:   resolved.Peers,
+		Config:  resolved,
 		Network: UDPNetwork{},
 		Cipher:  cipher,
-		Config:  store,
+		Store:   store,
 	})
 	if err != nil {
 		return err

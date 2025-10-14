@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"yap/chat"
+
+	"yap/internal/config"
 )
 
 func (c *CLI) runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(c.stderr())
-	configPath := fs.String("config", chat.DefaultConfigPath(), "path to yap config file")
+	configPath := fs.String("config", config.DefaultPath(), "path to yap config file")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -23,7 +24,7 @@ func (c *CLI) runInit(args []string) error {
 		return errors.New("config path is required; use -config to set one")
 	}
 
-	store, err := chat.LoadConfig(*configPath)
+	store, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
@@ -31,7 +32,7 @@ func (c *CLI) runInit(args []string) error {
 		return errors.New("config storage unavailable")
 	}
 
-	current, err := chat.ResolveProfile(store, "")
+	current, err := config.ResolveProfile(store, "")
 	if err != nil {
 		return err
 	}
@@ -57,29 +58,15 @@ func (c *CLI) runInit(args []string) error {
 	}
 	peers := parsePeers(peersRaw)
 
-	snapshot := chat.Config{
-		Name:   name,
-		Listen: listen,
-		Secret: secret,
-		Peers:  peers,
-	}
+	snapshot := config.Snapshot(name, listen, secret, peers)
 
 	if err := store.SaveDefault(snapshot); err != nil {
 		return fmt.Errorf("save default config: %w", err)
 	}
 
 	fmt.Fprintf(c.stdout(), "Saved default configuration to %s\n", *configPath)
-	fmt.Fprintf(c.stdout(), "  name: %s\n", snapshot.Name)
-	fmt.Fprintf(c.stdout(), "  listen: %s\n", snapshot.Listen)
-	if snapshot.Secret != "" {
-		fmt.Fprintln(c.stdout(), "  encryption: enabled")
-	} else {
-		fmt.Fprintln(c.stdout(), "  encryption: disabled")
-	}
-	if len(snapshot.Peers) > 0 {
-		fmt.Fprintf(c.stdout(), "  peers: %s\n", strings.Join(snapshot.Peers, ", "))
-	} else {
-		fmt.Fprintln(c.stdout(), "  peers: none configured yet")
+	for _, line := range config.Summary(snapshot) {
+		fmt.Fprintln(c.stdout(), line)
 	}
 
 	return nil

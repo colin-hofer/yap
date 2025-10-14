@@ -16,6 +16,7 @@ const (
 	errorMsg  msgType = "error"
 	systemMsg msgType = "system"
 	promptMsg msgType = "prompt"
+	peersMsg  msgType = "peers"
 )
 
 type Message struct {

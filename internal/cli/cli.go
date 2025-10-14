@@ -4,18 +4,20 @@ import (
 	"bytes"
 	"errors"
 	"io"
+
+	"yap/internal/config"
 )
 
 // CLI coordinates subcommands and forwards arguments to the chat runtime.
 type CLI struct {
-	in   io.Reader
-	out  io.Writer
-	err  io.Writer
-	chat func([]string) error
+	in     io.Reader
+	out    io.Writer
+	err    io.Writer
+	runner func(config.Config, config.Store) error
 }
 
-func New(in io.Reader, out io.Writer, err io.Writer, chat func([]string) error) *CLI {
-	return &CLI{in: in, out: out, err: err, chat: chat}
+func New(in io.Reader, out io.Writer, err io.Writer, runner func(config.Config, config.Store) error) *CLI {
+	return &CLI{in: in, out: out, err: err, runner: runner}
 }
 
 func (c *CLI) Run(args []string) error {
@@ -42,10 +44,14 @@ func (c *CLI) runWith(args []string) error {
 }
 
 func (c *CLI) runChat(args []string) error {
-	if c.chat == nil {
+	resolved, store, err := c.resolveArgs(args)
+	if err != nil {
+		return err
+	}
+	if c.runner == nil {
 		return errors.New("chat runner not configured")
 	}
-	return c.chat(args)
+	return c.runner(resolved, store)
 }
 
 func (c *CLI) stdin() io.Reader {

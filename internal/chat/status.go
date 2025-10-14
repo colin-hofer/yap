@@ -5,6 +5,8 @@ import (
 	"net"
 	"sort"
 	"strings"
+
+	"yap/internal/membership"
 )
 
 func (c *Chat) emit(msg Message) {
@@ -40,21 +42,6 @@ func (c *Chat) emitPromptUpdate(name string) {
 	c.emit(Message{Type: promptMsg, Body: name})
 }
 
-func (c *Chat) pendingSnapshot() []string {
-	c.statusMu.RLock()
-	defer c.statusMu.RUnlock()
-
-	if len(c.pending) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(c.pending))
-	for key := range c.pending {
-		out = append(out, key)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func (c *Chat) lastEventValue() string {
 	c.statusMu.RLock()
 	defer c.statusMu.RUnlock()
@@ -62,65 +49,59 @@ func (c *Chat) lastEventValue() string {
 }
 
 func (c *Chat) markPending(addr net.Addr) {
-	if addr == nil || c.peers.Has(addr) {
+	if addr == nil {
 		return
 	}
-	key := addr.String()
-	added := false
-	c.statusMu.Lock()
-	if c.pending == nil {
-		c.pending = make(map[string]net.Addr)
+	addrStr := canonicalNetAddr(addr)
+	var added bool
+	if c.members != nil {
+		added = c.members.AddPending(addrStr)
 	}
-	if _, ok := c.pending[key]; !ok {
-		c.pending[key] = addr
-		added = true
-	}
-	c.statusMu.Unlock()
 	if added {
-		c.recordEvent("contacting %s", key)
+		c.recordEvent("contacting %s", addrStr)
 	}
 }
 
-func (c *Chat) markActive(addr net.Addr) bool {
+func (c *Chat) markActive(addr net.Addr, name string) bool {
 	if addr == nil {
 		return false
 	}
-	added := c.peers.Add(addr)
-	key := addr.String()
-	wasPending := false
-	c.statusMu.Lock()
-	if _, ok := c.pending[key]; ok {
-		delete(c.pending, key)
-		wasPending = true
+	addrStr, added := c.rememberAddr(addr)
+	if addrStr == "" {
+		return false
 	}
-	c.statusMu.Unlock()
-	if added || wasPending {
-		c.recordEvent("connected %s", key)
+	var transitioned bool
+	if c.members != nil {
+		transitioned = c.members.MarkActive(addrStr, name)
 	}
-	return added
+	if added || transitioned {
+		c.recordEvent("connected %s", addrStr)
+	}
+	return added || transitioned
 }
 
 func (c *Chat) dropPeer(addr net.Addr, reason string) bool {
 	if addr == nil {
 		return false
 	}
-	key := addr.String()
-	wasActive := c.peers.Drop(addr)
-	wasPending := false
-	c.statusMu.Lock()
-	if _, ok := c.pending[key]; ok {
-		delete(c.pending, key)
-		wasPending = true
+	addrStr := canonicalNetAddr(addr)
+	removed := c.forgetAddr(addr)
+	var changed bool
+	if c.members != nil {
+		if reason == "left the chat" {
+			changed = c.members.Remove(addrStr)
+		} else {
+			changed = c.members.MarkFailed(addrStr)
+		}
 	}
-	c.statusMu.Unlock()
-	if !wasActive && !wasPending {
+	if !removed && !changed {
 		return false
 	}
 	event := reason
 	if event == "" {
-		event = fmt.Sprintf("disconnected %s", key)
-	} else if !strings.Contains(event, key) {
-		event = fmt.Sprintf("%s: %s", key, event)
+		event = fmt.Sprintf("disconnected %s", addrStr)
+	} else if !strings.Contains(event, addrStr) {
+		event = fmt.Sprintf("%s: %s", addrStr, event)
 	}
 	c.recordEvent(event)
 	return true
@@ -132,29 +113,47 @@ func (c *Chat) recordEvent(format string, args ...any) {
 	c.lastEvent = fmt.Sprintf(format, args...)
 }
 
-func (c *Chat) describePeers() string {
-	active := c.peers.Snapshot()
-	sort.Strings(active)
-	pending := c.pendingSnapshot()
-	last := c.lastEventValue()
-
-	encState := "disabled"
-	if c.cipher != nil {
-		encState = "enabled"
-	}
-
-	var b strings.Builder
-	b.WriteString("┌ peers summary\n")
-	b.WriteString(fmt.Sprintf("│ encryption: %s\n", encState))
-	b.WriteString(fmt.Sprintf("│ active (%d): %s\n", len(active), summarizeList(active)))
-	b.WriteString(fmt.Sprintf("│ pending (%d): %s\n", len(pending), summarizeList(pending)))
-	if last != "" {
-		b.WriteString(fmt.Sprintf("│ last event: %s\n", last))
+func (c *Chat) peersSummary() string {
+	var active []string
+	var pending []string
+	if c.members != nil {
+		activeMembers, pendingMembers := c.members.Snapshot()
+		active = formatMemberAddrs(activeMembers)
+		pending = formatMemberAddrs(pendingMembers)
 	} else {
-		b.WriteString("│ last event: n/a\n")
+		active = c.addressKeys()
 	}
-	b.WriteString("└")
-	return b.String()
+	lines := []string{
+		fmt.Sprintf("active (%d): %s", len(active), summarizeList(active)),
+		fmt.Sprintf("pending (%d): %s", len(pending), summarizeList(pending)),
+	}
+	if c.transport != nil {
+		state := "disabled"
+		if c.transport.EncryptionEnabled() {
+			state = "enabled"
+		}
+		lines = append(lines, fmt.Sprintf("encryption: %s", state))
+	}
+	if last := c.lastEventValue(); last != "" {
+		lines = append(lines, fmt.Sprintf("last event: %s", last))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatMemberAddrs(members []membership.Member) []string {
+	if len(members) == 0 {
+		return nil
+	}
+	list := make([]string, 0, len(members))
+	for _, member := range members {
+		label := member.Addr
+		if member.Name != "" {
+			label = fmt.Sprintf("%s (%s)", member.Addr, member.Name)
+		}
+		list = append(list, label)
+	}
+	sort.Strings(list)
+	return list
 }
 
 func summarizeList(items []string) string {

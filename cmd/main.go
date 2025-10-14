@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"yap/chat"
+	"yap/internal/chat"
 	"yap/internal/cli"
 )
 
