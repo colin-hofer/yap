@@ -25,12 +25,12 @@ const (
 	borderSelf    = "\033[38;5;39m"
 )
 
-// RunBubbleUI starts the Bubble Tea interface and blocks until it exits.
-func RunBubbleUI(user string, events <-chan Message, submit func(string) error) error {
+// runBubbleUI starts the Bubble Tea interface and blocks until it exits.
+func runBubbleUI(user string, events <-chan Message, submit func(string) error) error {
 	m := newBubbleModel(user, events, submit)
 	program := tea.NewProgram(m)
 	_, err := program.Run()
-	if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, ErrQuit) {
+	if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, errQuit) {
 		return nil
 	}
 	return err
@@ -46,6 +46,7 @@ type bubbleModel struct {
 	quitting bool
 }
 
+// newBubbleModel constructs the Bubble Tea state machine for the chat UI.
 func newBubbleModel(user string, events <-chan Message, submit func(string) error) *bubbleModel {
 	return &bubbleModel{
 		user:    user,
@@ -55,10 +56,12 @@ func newBubbleModel(user string, events <-chan Message, submit func(string) erro
 	}
 }
 
+// Init requests the first message from the event stream.
 func (m *bubbleModel) Init() tea.Cmd {
 	return waitForEvent(m.events)
 }
 
+// waitForEvent blocks until the next chat event or closure.
 func waitForEvent(events <-chan Message) tea.Cmd {
 	return func() tea.Msg {
 		msg, ok := <-events
@@ -69,6 +72,7 @@ func waitForEvent(events <-chan Message) tea.Cmd {
 	}
 }
 
+// Update handles key presses, incoming messages, and terminal signals.
 func (m *bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -80,7 +84,7 @@ func (m *bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			text := strings.TrimSpace(string(m.input))
 			m.input = m.input[:0]
 			if text != "" && m.submit != nil {
-				if err := m.submit(text); err != nil && !errors.Is(err, ErrQuit) {
+				if err := m.submit(text); err != nil && !errors.Is(err, errQuit) {
 					m.append(renderSystem(err.Error()))
 				}
 			}
@@ -115,6 +119,7 @@ func (m *bubbleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// View renders the chat history and input prompt.
 func (m *bubbleModel) View() string {
 	var b strings.Builder
 	for _, blk := range m.history {
@@ -126,6 +131,7 @@ func (m *bubbleModel) View() string {
 	return b.String()
 }
 
+// append adds a formatted block to the scrollback, coalescing similar entries.
 func (m *bubbleModel) append(blk block) {
 	if len(m.history) > 0 {
 		last := m.history[len(m.history)-1]
@@ -142,6 +148,7 @@ func (m *bubbleModel) append(blk block) {
 	m.history = append(m.history, blk)
 }
 
+// renderSystem formats a system notification block.
 func renderSystem(text string) block {
 	header := fmt.Sprintf("%s[%s]%s system", ansiTimestamp, time.Now().Format("15:04:05"), ansiReset)
 	lines := strings.Split(text, "\n")
@@ -152,6 +159,7 @@ func renderSystem(text string) block {
 	return block{key: "system", border: borderSystem, header: header, lines: colored, timestamp: time.Now()}
 }
 
+// renderMessage styles an incoming application message for display.
 func renderMessage(user string, msg Message) block {
 	ts := msg.Timestamp
 	if ts == 0 {
@@ -205,6 +213,7 @@ func renderMessage(user string, msg Message) block {
 	return block{key: key, border: border, header: header, lines: lines, timestamp: time.Unix(ts, 0)}
 }
 
+// messageLines splits and colorizes a message body by type.
 func messageLines(kind msgType, from, body, color string) []string {
 	var text string
 	switch kind {
@@ -249,6 +258,7 @@ type block struct {
 	timestamp time.Time
 }
 
+// renderBlockString assembles the ANSI bordered block string for output.
 func renderBlockString(blk block) string {
 	var b strings.Builder
 	b.WriteString(blk.border)

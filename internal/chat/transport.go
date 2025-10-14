@@ -9,45 +9,53 @@ import (
 	"time"
 )
 
+// transport handles encoding and network IO for the session.
 type transport struct {
 	name   string
 	conn   net.PacketConn
 	seen   sync.Map
 	mu     sync.RWMutex
-	cipher Cipher
+	cipher packetCipher
 }
 
-func newTransport(name string, conn net.PacketConn, cipher Cipher) *transport {
+// newTransport wires up the UDP socket and optional cipher wrapper.
+func newTransport(name string, conn net.PacketConn, cipher packetCipher) *transport {
 	return &transport{name: name, conn: conn, cipher: cipher}
 }
 
-func (t *transport) LocalAddr() net.Addr {
+// localAddr exposes the underlying socket's bound address.
+func (t *transport) localAddr() net.Addr {
 	return t.conn.LocalAddr()
 }
 
-func (t *transport) EncryptionEnabled() bool {
+// encryptionEnabled reports whether a cipher has been configured.
+func (t *transport) encryptionEnabled() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.cipher != nil
 }
 
-func (t *transport) SetCipher(cipher Cipher) {
+// setCipher swaps the active cipher to use for subsequent messages.
+func (t *transport) setCipher(cipher packetCipher) {
 	t.mu.Lock()
 	t.cipher = cipher
 	t.mu.Unlock()
 }
 
-func (t *transport) SetName(name string) {
+// setName updates the sender name used in outbound messages.
+func (t *transport) setName(name string) {
 	t.mu.Lock()
 	t.name = name
 	t.mu.Unlock()
 }
 
-func (t *transport) Close() error {
+// close releases the underlying socket resources.
+func (t *transport) close() error {
 	return t.conn.Close()
 }
 
-func (t *transport) Listen(stop <-chan struct{}, handle func(Message, net.Addr, []byte, bool), reject func(Message, net.Addr), system func(string, ...any)) {
+// listen consumes packets from the socket and hands them to the session callbacks.
+func (t *transport) listen(stop <-chan struct{}, handle func(Message, net.Addr, []byte, bool), reject func(Message, net.Addr), system func(string, ...any)) {
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -123,6 +131,7 @@ func (t *transport) Listen(stop <-chan struct{}, handle func(Message, net.Addr, 
 	}()
 }
 
+// prepare assembles, encrypts, and marshals an outbound message.
 func (t *transport) prepare(name string, kind msgType, body string) (Message, []byte, error) {
 	msg := Message{
 		ID:        newMessageID(),
@@ -151,11 +160,13 @@ func (t *transport) prepare(name string, kind msgType, body string) (Message, []
 	return msg, raw, nil
 }
 
+// sendRaw writes an encoded packet to the specified network address.
 func (t *transport) sendRaw(addr net.Addr, data []byte) error {
 	_, err := t.conn.WriteTo(data, addr)
 	return err
 }
 
+// verifyAndDecrypt authenticates inbound payloads and restores plaintext bodies.
 func (t *transport) verifyAndDecrypt(msg *Message) (bool, string, error) {
 	if msg.Type == errorMsg {
 		return false, "", nil
@@ -191,6 +202,7 @@ func (t *transport) verifyAndDecrypt(msg *Message) (bool, string, error) {
 	return true, "", nil
 }
 
+// reject sends an error response back to a peer that failed authentication.
 func (t *transport) reject(addr net.Addr, reason string) (Message, error) {
 	msg := Message{
 		ID:        newMessageID(),
@@ -210,7 +222,8 @@ func (t *transport) reject(addr net.Addr, reason string) (Message, error) {
 	return msg, nil
 }
 
-func (t *transport) currentCipher() Cipher {
+// currentCipher safely retrieves the currently configured cipher instance.
+func (t *transport) currentCipher() packetCipher {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.cipher

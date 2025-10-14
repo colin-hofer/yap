@@ -8,16 +8,18 @@ import (
 	"errors"
 )
 
-type Cipher interface {
+// packetCipher defines the encryption contract used by the transport layer.
+type packetCipher interface {
 	Encrypt(plain []byte) ([]byte, []byte, error)
 	Decrypt(nonce, ciphertext []byte) ([]byte, error)
 }
 
-type AESCipher struct {
+type aesCipher struct {
 	gcm cipher.AEAD
 }
 
-func NewAESCipher(secret string) (Cipher, error) {
+// newAESCipher constructs an AES-GCM cipher from the supplied secret.
+func newAESCipher(secret string) (packetCipher, error) {
 	if secret == "" {
 		return nil, errors.New("secret cannot be empty")
 	}
@@ -33,10 +35,11 @@ func NewAESCipher(secret string) (Cipher, error) {
 		return nil, err
 	}
 
-	return &AESCipher{gcm: gcm}, nil
+	return &aesCipher{gcm: gcm}, nil
 }
 
-func (c *AESCipher) Encrypt(plain []byte) ([]byte, []byte, error) {
+// Encrypt applies AES-GCM and returns the nonce alongside the ciphertext.
+func (c *aesCipher) Encrypt(plain []byte) ([]byte, []byte, error) {
 	nonce := make([]byte, c.gcm.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, err
@@ -45,6 +48,7 @@ func (c *AESCipher) Encrypt(plain []byte) ([]byte, []byte, error) {
 	return nonce, ciphertext, nil
 }
 
-func (c *AESCipher) Decrypt(nonce, ciphertext []byte) ([]byte, error) {
+// Decrypt verifies and recovers the plaintext for a sealed message.
+func (c *aesCipher) Decrypt(nonce, ciphertext []byte) ([]byte, error) {
 	return c.gcm.Open(nil, nonce, ciphertext, nil)
 }

@@ -9,6 +9,15 @@ import (
 
 type msgType string
 
+const startupLogo = `
+██╗   ██╗ █████╗ ██████╗
+╚██╗ ██╔╝██╔══██╗██╔══██╗
+ ╚████╔╝ ███████║██████╔╝
+  ╚██╔╝  ██╔══██║██╔═══╝
+   ██║   ██║  ██║██║
+   ╚═╝   ╚═╝  ╚═╝╚═╝
+`
+
 const (
 	chatMsg   msgType = "chat"
 	joinMsg   msgType = "join"
@@ -29,6 +38,7 @@ type Message struct {
 	Nonce     string  `json:"nonce,omitempty"`
 }
 
+// newMessageID produces a random hexadecimal identifier for transport deduping.
 func newMessageID() string {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
