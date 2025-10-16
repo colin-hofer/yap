@@ -1,7 +1,0 @@
-./chat.go
-./cipher.go
-./config.go
-./message.go
-./network.go
-./peer.go
-./ui.go
