@@ -4,42 +4,50 @@
 
 ## Install
 
+<!-- BEGIN GENERATED INSTALL -->
 Current release: `v0.1.0`
 
 Linux (`amd64`):
 
 ```bash
-mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_linux_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v0.1.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 Linux (`arm64`):
 
 ```bash
-mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_linux_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v0.1.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 macOS (Apple Silicon):
 
 ```bash
-mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_darwin_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v0.1.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 macOS (Intel):
 
 ```bash
-mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_darwin_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v0.1.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 Windows (`PowerShell`, `amd64`):
 
 ```powershell
-$dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_windows_amd64.zip -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
+$version='v0.1.0'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_amd64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
+```
+
+Windows (`PowerShell`, `arm64`):
+
+```powershell
+$version='v0.1.0'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_arm64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
 ```
 
 After install, make sure the install directory is on your `PATH`:
 
 - Linux/macOS: `~/.local/bin`
 - Windows: `%USERPROFILE%\AppData\Local\yap`
+<!-- END GENERATED INSTALL -->
 
 ## Quick Start
 
@@ -124,3 +132,21 @@ YAP_TRANSPORT=quic yap
 ```
 
 This is opt-in because the pinned libp2p dependency line currently pulls a `quic-go` version that can panic on Go 1.26 during handshake.
+
+## Release
+
+Create and publish a new release with one command:
+
+```bash
+./scripts/release.sh v0.1.1
+```
+
+That command:
+
+- updates the generated install block in this README
+- runs tests and a local cross-platform release build
+- commits the README release bump if needed
+- creates and pushes the Git tag
+- waits for the GitHub Actions release workflow to finish
+
+GitHub Actions builds the release artifacts in CI and publishes the GitHub release automatically.
