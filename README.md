@@ -2,6 +2,53 @@
 
 `yap` is a LAN-first peer-to-peer chat client written in Go. It uses a terminal UI for everyday use, libp2p for transport and discovery, and a room key shared through an explicit pairing flow.
 
+## Install
+
+Current release: `v0.1.0`
+
+Linux (`amd64`):
+
+```bash
+mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_linux_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+```
+
+Linux (`arm64`):
+
+```bash
+mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_linux_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+```
+
+macOS (Apple Silicon):
+
+```bash
+mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_darwin_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+```
+
+macOS (Intel):
+
+```bash
+mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_darwin_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+```
+
+Windows (`PowerShell`, `amd64`):
+
+```powershell
+$dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest https://github.com/colin-hofer/yap/releases/download/v0.1.0/yap_0.1.0_windows_amd64.zip -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
+```
+
+After install, make sure the install directory is on your `PATH`:
+
+- Linux/macOS: `~/.local/bin`
+- Windows: `%USERPROFILE%\AppData\Local\yap`
+
+## Quick Start
+
+1. Run `yap`.
+2. Press `n` to create a swarm and enter a name.
+3. Press `i` to generate an invite code.
+4. On another machine, run `yap`, select the nearby peer, press `j`, and enter the code.
+5. Approve pairing on both sides and start chatting.
+
 ## Goals
 
 - Zero-config local discovery on the same network
