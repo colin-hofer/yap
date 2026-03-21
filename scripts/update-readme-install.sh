@@ -62,6 +62,8 @@ After install, make sure the install directory is on your `PATH`:
 
 - Linux/macOS: `~/.local/bin`
 - Windows: `%USERPROFILE%\AppData\Local\yap`
+
+Once installed, `yap update` downloads the latest GitHub release for your current OS/arch and replaces the installed binary in place.
 EOF
 
 sed "s|__VERSION__|$VERSION|g; s|__REPO__|$REPO_SLUG|g" "$BLOCK_FILE" > "$TMP_FILE"

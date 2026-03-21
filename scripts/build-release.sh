@@ -42,7 +42,7 @@ for target in "${TARGETS[@]}"; do
 
   echo "building $GOOS/$GOARCH"
   GOCACHE="$ROOT/.gocache" GOOS="$GOOS" GOARCH="$GOARCH" \
-    go build -trimpath -ldflags="-s -w" -o "$WORK_DIR/$BIN_NAME" ./cmd/yap
+    go build -trimpath -ldflags="-s -w -X yap/internal/version.Version=${VERSION}" -o "$WORK_DIR/$BIN_NAME" ./cmd/yap
 
   ARCHIVE_BASE="yap_${VERSION_NO_V}_${GOOS}_${GOARCH}"
   if [[ "$GOOS" == "windows" ]]; then

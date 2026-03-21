@@ -47,6 +47,8 @@ After install, make sure the install directory is on your `PATH`:
 
 - Linux/macOS: `~/.local/bin`
 - Windows: `%USERPROFILE%\AppData\Local\yap`
+
+Once installed, `yap update` downloads the latest GitHub release for your current OS/arch and replaces the installed binary in place.
 <!-- END GENERATED INSTALL -->
 
 ## Quick Start
@@ -92,6 +94,8 @@ The implementation follows a layered design:
 yap
 yap open <swarm-name-or-id>
 yap join <invite-code>
+yap update
+yap version
 ```
 
 ## Home Screen Controls
@@ -102,6 +106,7 @@ yap join <invite-code>
 - `n`: create a new swarm
 - `i`: generate an invite for the selected swarm
 - `j`: join a selected nearby peer with an invite code
+- `u`: quit the TUI and install the latest GitHub release for the current OS/arch
 - `q`: quit
 
 ## Chat Controls

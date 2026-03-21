@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -14,6 +15,8 @@ import (
 
 	"yap/internal/app"
 	"yap/internal/model"
+	"yap/internal/update"
+	"yap/internal/version"
 )
 
 var (
@@ -40,14 +43,26 @@ var (
 )
 
 // Run starts the Bubble Tea program.
-func Run(service *app.Service) error {
+func Run(service *app.Service) (RunResult, error) {
 	m := newModel(service)
 	program := tea.NewProgram(m)
-	_, err := program.Run()
+	finalModel, err := program.Run()
+	shutdownErr := service.Shutdown()
 	if err != nil {
-		return err
+		return RunResult{}, err
 	}
-	return service.Shutdown()
+	if shutdownErr != nil {
+		return RunResult{}, shutdownErr
+	}
+	result := RunResult{}
+	if model, ok := finalModel.(*modelUI); ok {
+		result.UpdateRequested = model.updateRequested
+	}
+	return result, nil
+}
+
+type RunResult struct {
+	UpdateRequested bool
 }
 
 type modelUI struct {
@@ -64,6 +79,9 @@ type modelUI struct {
 	nearbyIdx int
 	status    string
 
+	updateRequested bool
+	checkingUpdate  bool
+
 	messages viewport.Model
 	composer textarea.Model
 	prompt   textinput.Model
@@ -76,6 +94,11 @@ type modalState struct {
 	Message  string
 	Approval *app.Event
 	Invite   *model.Invite
+}
+
+type updateCheckMsg struct {
+	Result update.Result
+	Err    error
 }
 
 func newModel(service *app.Service) *modelUI {
@@ -137,6 +160,22 @@ func waitForAppEvent(events <-chan app.Event) tea.Cmd {
 	}
 }
 
+func checkForUpdateCmd() tea.Cmd {
+	return func() tea.Msg {
+		updater, err := update.New(update.Config{
+			RepoOwner:      version.RepositoryOwner,
+			RepoName:       version.RepositoryName,
+			BinaryName:     version.BinaryName,
+			CurrentVersion: version.Current(),
+		})
+		if err != nil {
+			return updateCheckMsg{Err: err}
+		}
+		result, err := updater.Check(context.Background())
+		return updateCheckMsg{Result: result, Err: err}
+	}
+}
+
 func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -148,6 +187,26 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := waitForAppEvent(m.events)
 		m.applyAppEvent(msg)
 		return m, cmd
+	case updateCheckMsg:
+		m.checkingUpdate = false
+		if msg.Err != nil {
+			m.status = msg.Err.Error()
+			return m, nil
+		}
+		if !msg.Result.Available {
+			m.status = fmt.Sprintf("already up to date (%s)", displayVersion(msg.Result.LatestVersion))
+			return m, nil
+		}
+		m.modal = modalState{
+			Kind:  "update",
+			Title: "Install Update",
+			Message: fmt.Sprintf(
+				"Update %s -> %s is available.\n\nQuit yap and install the latest GitHub release for this OS/arch?",
+				displayVersion(msg.Result.PreviousVersion),
+				displayVersion(msg.Result.LatestVersion),
+			),
+		}
+		return m, nil
 	case tea.MouseWheelMsg:
 		if m.mode == "chat" && m.modal.Kind == "" {
 			var cmd tea.Cmd
@@ -250,6 +309,13 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.prompt.Placeholder = "Invite code"
 		m.prompt.Focus()
 		m.modal = modalState{Kind: "join", Title: "Join Swarm", Message: "Enter the invite code from a nearby peer."}
+	case "u":
+		if m.checkingUpdate {
+			return m, nil
+		}
+		m.status = "checking latest release"
+		m.checkingUpdate = true
+		return m, checkForUpdateCmd()
 	}
 	return m, nil
 }
@@ -325,6 +391,18 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				_ = m.service.ResolveApproval(m.modal.Approval.Approval.ID, false)
 			}
 			m.modal = modalState{}
+		}
+		return m, nil
+	case "update":
+		switch msg.String() {
+		case "y", "enter":
+			m.updateRequested = true
+			m.status = "closing to install the latest release"
+			m.modal = modalState{}
+			return m, tea.Quit
+		case "n", "esc":
+			m.modal = modalState{}
+			m.status = "update canceled"
 		}
 		return m, nil
 	}
@@ -491,7 +569,7 @@ func (m *modelUI) renderHome(width, height int) string {
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
 		statusStyle.Render(m.status) + "\n" +
-			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  q quit"),
+			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  u update  ·  q quit"),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
@@ -669,6 +747,9 @@ func (m *modelUI) modalBody() string {
 	case "approval":
 		lines = append(lines, "")
 		lines = append(lines, mutedStyle.Render("y accept  ·  n reject"))
+	case "update":
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("enter/y confirm  ·  esc/n cancel"))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -749,4 +830,11 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:10]
+}
+
+func displayVersion(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	return value
 }
