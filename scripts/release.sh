@@ -41,10 +41,17 @@ if git ls-remote --tags --exit-code origin "refs/tags/$VERSION" >/dev/null 2>&1;
   exit 1
 fi
 
+if gh release view "$VERSION" >/dev/null 2>&1; then
+  echo "GitHub release $VERSION already exists" >&2
+  exit 1
+fi
+
 ./scripts/update-readme-install.sh "$VERSION"
 
 GOCACHE="$ROOT/.gocache" go test ./...
 ./scripts/build-release.sh "$VERSION" >/dev/null
+
+DIST_DIR="$ROOT/dist/$VERSION"
 
 if ! git diff --quiet -- README.md; then
   git add README.md
@@ -55,21 +62,6 @@ git tag -a "$VERSION" -m "$VERSION"
 git push origin "$CURRENT_BRANCH"
 git push origin "$VERSION"
 
-echo "pushed $VERSION"
-
-RUN_ID=""
-for _ in {1..12}; do
-  RUN_ID="$(gh run list --workflow release.yml --limit 20 --json databaseId,headSha --jq ".[] | select(.headSha == \"$(git rev-parse HEAD)\") | .databaseId" | head -n1 || true)"
-  if [[ -n "$RUN_ID" ]]; then
-    break
-  fi
-  sleep 5
-done
-
-if [[ -n "$RUN_ID" ]]; then
-  gh run watch "$RUN_ID" --exit-status
-else
-  echo "release workflow was not visible yet; watch it manually with: gh run list --workflow release.yml --limit 5"
-fi
+gh release create "$VERSION" "$DIST_DIR"/* --title "$VERSION" --verify-tag --generate-notes
 
 echo "Release URL: https://github.com/$(./scripts/repo-slug.sh)/releases/tag/${VERSION}"

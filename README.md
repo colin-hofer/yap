@@ -137,21 +137,3 @@ YAP_TRANSPORT=quic yap
 ```
 
 This is opt-in because the pinned libp2p dependency line currently pulls a `quic-go` version that can panic on Go 1.26 during handshake.
-
-## Release
-
-Create and publish a new release with one command:
-
-```bash
-./scripts/release.sh v0.1.1
-```
-
-That command:
-
-- updates the generated install block in this README
-- runs tests and a local cross-platform release build
-- commits the README release bump if needed
-- creates and pushes the Git tag
-- waits for the GitHub Actions release workflow to finish
-
-GitHub Actions builds the release artifacts in CI and publishes the GitHub release automatically.
