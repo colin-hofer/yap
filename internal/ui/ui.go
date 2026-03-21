@@ -5,32 +5,33 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"yap/internal/app"
 	"yap/internal/model"
 )
 
 var (
-	colorBg       = lipgloss.Color("#0F1417")
-	colorPanel    = lipgloss.Color("#172026")
-	colorMuted    = lipgloss.Color("#6A7A87")
-	colorAccent   = lipgloss.Color("#7FDBB6")
-	colorAccent2  = lipgloss.Color("#F2C879")
-	colorBorder   = lipgloss.Color("#31424D")
-	colorStrong   = lipgloss.Color("#E8F0F2")
-	colorDanger   = lipgloss.Color("#F16E5B")
-	colorSelf     = lipgloss.Color("#9AD1FF")
-	colorPeer     = lipgloss.Color("#F4F7F8")
-	colorJoin     = lipgloss.Color("#9BE48D")
-	colorLeave    = lipgloss.Color("#FFB199")
-	colorStale    = lipgloss.Color("#E0BE75")
-	panelStyle    = lipgloss.NewStyle().Background(colorPanel).Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
-	titleStyle    = lipgloss.NewStyle().Foreground(colorStrong).Bold(true)
+	colorMuted   = lipgloss.Color("#6A7A87")
+	colorAccent  = lipgloss.Color("#7FDBB6")
+	colorAccent2 = lipgloss.Color("#F2C879")
+	colorBorder  = lipgloss.Color("#31424D")
+	colorStrong  = lipgloss.Color("#E8F0F2")
+	colorDanger  = lipgloss.Color("#F16E5B")
+	colorSelf    = lipgloss.Color("#9AD1FF")
+	colorPeer    = lipgloss.Color("#F4F7F8")
+	colorJoin    = lipgloss.Color("#9BE48D")
+	colorLeave   = lipgloss.Color("#FFB199")
+	colorStale   = lipgloss.Color("#E0BE75")
+
+	panelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
+	modalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
+	titleStyle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 	accentStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 	statusStyle   = lipgloss.NewStyle().Foreground(colorAccent2)
@@ -40,8 +41,8 @@ var (
 
 // Run starts the Bubble Tea program.
 func Run(service *app.Service) error {
-	model := newModel(service)
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	m := newModel(service)
+	program := tea.NewProgram(m)
 	_, err := program.Run()
 	if err != nil {
 		return err
@@ -79,11 +80,19 @@ type modalState struct {
 
 func newModel(service *app.Service) *modelUI {
 	composer := textarea.New()
-	composer.Placeholder = "Write a message. Ctrl+S sends."
+	composer.Placeholder = "Type a message..."
 	composer.CharLimit = 4000
-	composer.SetHeight(4)
+	composer.SetHeight(3)
 	composer.ShowLineNumbers = false
-	composer.FocusedStyle.CursorLine = lipgloss.NewStyle()
+
+	// Remap InsertNewline from enter to shift+enter so enter can send.
+	km := composer.KeyMap
+	km.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"))
+	composer.KeyMap = km
+
+	styles := composer.Styles()
+	styles.Focused.CursorLine = lipgloss.NewStyle()
+	composer.SetStyles(styles)
 	composer.Blur()
 
 	prompt := textinput.New()
@@ -103,7 +112,7 @@ func newModel(service *app.Service) *modelUI {
 		mode:     mode,
 		focus:    "swarms",
 		status:   "ready",
-		messages: viewport.New(0, 0),
+		messages: viewport.New(),
 		composer: composer,
 		prompt:   prompt,
 	}
@@ -134,7 +143,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := waitForAppEvent(m.events)
 		m.applyAppEvent(msg)
 		return m, cmd
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.modal.Kind != "" {
 			return m.handleModal(msg)
 		}
@@ -146,7 +155,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *modelUI) View() string {
+func (m *modelUI) View() tea.View {
 	width := m.width
 	height := m.height
 	if width == 0 {
@@ -156,7 +165,7 @@ func (m *modelUI) View() string {
 		height = 34
 	}
 
-	base := lipgloss.NewStyle().Background(colorBg).Foreground(colorStrong).Width(width).Height(height)
+	base := lipgloss.NewStyle().Foreground(colorStrong).Width(width).Height(height)
 	var content string
 	if m.mode == "chat" && m.state.ActiveSwarm != nil {
 		content = m.renderChat(width, height)
@@ -166,10 +175,16 @@ func (m *modelUI) View() string {
 	if m.modal.Kind != "" {
 		content = m.renderModal(content, width, height)
 	}
-	return base.Render(content)
+	v := tea.NewView(base.Render(content))
+	v.AltScreen = true
+	return v
 }
 
-func (m *modelUI) handleHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// ---------------------------------------------------------------------------
+// Key handlers
+// ---------------------------------------------------------------------------
+
+func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -203,7 +218,7 @@ func (m *modelUI) handleHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.prompt.SetValue("")
 		m.prompt.Placeholder = "Swarm name"
 		m.prompt.Focus()
-		m.modal = modalState{Kind: "new", Title: "Create Swarm", Message: "Create a saved room with a persistent room key."}
+		m.modal = modalState{Kind: "new", Title: "Create Swarm", Message: "Name your new swarm."}
 	case "i":
 		swarm := m.selectedSwarm()
 		if swarm == nil {
@@ -221,12 +236,12 @@ func (m *modelUI) handleHome(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.prompt.SetValue("")
 		m.prompt.Placeholder = "Invite code"
 		m.prompt.Focus()
-		m.modal = modalState{Kind: "join", Title: "Join with Invite", Message: "Enter the invite code shared by the selected nearby peer."}
+		m.modal = modalState{Kind: "join", Title: "Join Swarm", Message: "Enter the invite code from a nearby peer."}
 	}
 	return m, nil
 }
 
-func (m *modelUI) handleChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -237,7 +252,7 @@ func (m *modelUI) handleChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = "home"
 		m.composer.Blur()
 		return m, nil
-	case "ctrl+s":
+	case "enter":
 		body := strings.TrimSpace(m.composer.Value())
 		if body == "" {
 			return m, nil
@@ -250,12 +265,13 @@ func (m *modelUI) handleChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.syncTranscript()
 		return m, nil
 	}
+	// Everything else (including shift+enter for newline) goes to textarea.
 	var cmd tea.Cmd
 	m.composer, cmd = m.composer.Update(msg)
 	return m, cmd
 }
 
-func (m *modelUI) handleModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch m.modal.Kind {
 	case "new":
 		return m.handleCreateSwarmModal(msg)
@@ -284,7 +300,7 @@ func (m *modelUI) handleModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *modelUI) handleCreateSwarmModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *modelUI) handleCreateSwarmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.modal = modalState{}
@@ -306,7 +322,7 @@ func (m *modelUI) handleCreateSwarmModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *modelUI) handleJoinModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.modal = modalState{}
@@ -329,6 +345,10 @@ func (m *modelUI) handleJoinModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.prompt, cmd = m.prompt.Update(msg)
 	return m, cmd
 }
+
+// ---------------------------------------------------------------------------
+// Event handling
+// ---------------------------------------------------------------------------
 
 func (m *modelUI) applyAppEvent(event app.Event) {
 	switch event.Type {
@@ -357,7 +377,7 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 		m.modal = modalState{
 			Kind:    "invite",
 			Title:   "Invite Ready",
-			Message: "Share this code with a nearby peer. The invite expires automatically.",
+			Message: "Share this code with a nearby peer.",
 			Invite:  event.Invite,
 		}
 	case app.EventApproval:
@@ -371,36 +391,45 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
+
 func (m *modelUI) syncLayout() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
 	if m.mode == "chat" {
-		chatWidth := m.width - 34
-		if chatWidth < 20 {
+		sidebarWidth := 26
+		chatWidth := m.width - sidebarWidth
+		if chatWidth < 30 {
 			chatWidth = m.width
 		}
-		msgHeight := m.height - 13
+		msgHeight := m.height - 11
 		if msgHeight < 6 {
 			msgHeight = 6
 		}
-		m.messages.Width = chatWidth - 4
-		m.messages.Height = msgHeight
+		m.messages.SetWidth(chatWidth - 6)
+		m.messages.SetHeight(msgHeight)
 		m.composer.SetWidth(chatWidth - 6)
 		m.syncTranscript()
 	}
 }
 
 func (m *modelUI) syncTranscript() {
-	m.messages.SetContent(m.renderTranscript(m.state.Transcript, m.messages.Width))
+	m.messages.SetContent(m.renderTranscript(m.state.Transcript, m.messages.Width()))
 	m.messages.GotoBottom()
 }
 
+// ---------------------------------------------------------------------------
+// Render: Home
+// ---------------------------------------------------------------------------
+
 func (m *modelUI) renderHome(width, height int) string {
-	header := lipgloss.NewStyle().Padding(1, 2).Render(
-		titleStyle.Render("yap") + "  " +
-			mutedStyle.Render("LAN chat") + "\n" +
-			accentStyle.Render(m.state.Identity.Name) + "  " + mutedStyle.Render(shortID(m.state.Identity.PeerID)),
+	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
+		titleStyle.Render("yap") + mutedStyle.Render("  ") +
+			lipgloss.NewStyle().Foreground(colorStrong).Bold(true).Render(m.state.Identity.Name) +
+			mutedStyle.Render("  "+shortID(m.state.Identity.PeerID)),
 	)
 
 	leftWidth := width / 2
@@ -412,60 +441,22 @@ func (m *modelUI) renderHome(width, height int) string {
 		rightWidth = width
 	}
 
-	swarms := panelStyle.Width(leftWidth - 2).Height(height - 8).Render(m.renderSwarms())
-	nearby := panelStyle.Width(rightWidth - 2).Height(height - 8).Render(m.renderNearby())
+	panelHeight := height - 6
+	swarms := panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderSwarms())
+	nearby := panelStyle.Width(rightWidth).Height(panelHeight).Render(m.renderNearby())
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, swarms, nearby)
-	footer := panelStyle.Width(width - 4).Render(
-		statusStyle.Render("status") + "  " + m.status + "\n" +
-			mutedStyle.Render("tab focus  •  enter open  •  n new swarm  •  i invite  •  j join with code  •  q quit"),
+
+	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
+		statusStyle.Render(m.status) + "\n" +
+			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  q quit"),
 	)
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-}
-
-func (m *modelUI) renderChat(width, height int) string {
-	active := m.state.ActiveSwarm
-	if active == nil {
-		return ""
-	}
-	header := panelStyle.Width(width - 4).Render(
-		titleStyle.Render(active.Name) + "  " + mutedStyle.Render(shortID(active.ID)) + "\n" +
-			mutedStyle.Render(fmt.Sprintf("%d peers", len(m.state.Presence))) + "  " +
-			statusStyle.Render(m.status),
-	)
-
-	sidebarWidth := 30
-	mainWidth := width - sidebarWidth - 4
-	if mainWidth < 30 {
-		mainWidth = width - 4
-		sidebarWidth = 0
-	}
-	msgHeight := height - 14
-	if msgHeight < 8 {
-		msgHeight = 8
-	}
-	m.messages.Width = mainWidth - 4
-	m.messages.Height = msgHeight
-	m.composer.SetWidth(mainWidth - 6)
-	m.syncTranscript()
-
-	main := panelStyle.Width(mainWidth - 2).Height(msgHeight + 7).Render(
-		m.messages.View() + "\n\n" + m.composer.View(),
-	)
-	peers := panelStyle.Width(sidebarWidth - 2).Height(msgHeight + 7).Render(m.renderPresence())
-	footer := panelStyle.Width(width - 4).Render(mutedStyle.Render("ctrl+s send  •  enter newline  •  esc leave chat  •  ctrl+c quit"))
-
-	body := main
-	if sidebarWidth > 0 {
-		body = lipgloss.JoinHorizontal(lipgloss.Top, main, peers)
-	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
 
 func (m *modelUI) renderSwarms() string {
 	var lines []string
-	lines = append(lines, titleStyle.Render("Saved Swarms"))
-	lines = append(lines, mutedStyle.Render("Persistent rooms on this device."))
+	lines = append(lines, titleStyle.Render("Swarms"))
 	if len(m.state.Swarms) == 0 {
 		lines = append(lines, "", mutedStyle.Render("No swarms yet. Press n to create one."))
 		return strings.Join(lines, "\n")
@@ -475,21 +466,22 @@ func (m *modelUI) renderSwarms() string {
 		if i == m.swarmIdx && m.focus == "swarms" {
 			label = selectedStyle.Render(label)
 		}
-		lines = append(lines, "", label)
-		lines = append(lines, mutedStyle.Render(fmt.Sprintf("trusted peers %d", len(swarm.TrustedPeers))))
+		lines = append(lines, "")
+		lines = append(lines, label)
+		meta := fmt.Sprintf("%d peers", len(swarm.TrustedPeers))
 		if !swarm.LastOpened.IsZero() {
-			lines = append(lines, mutedStyle.Render("opened "+swarm.LastOpened.Format("Jan 2 15:04")))
+			meta += " · " + swarm.LastOpened.Format("Jan 2 15:04")
 		}
+		lines = append(lines, mutedStyle.Render(meta))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (m *modelUI) renderNearby() string {
 	var lines []string
-	lines = append(lines, titleStyle.Render("Nearby Peers"))
-	lines = append(lines, mutedStyle.Render("mDNS discovery on the local network."))
+	lines = append(lines, titleStyle.Render("Nearby"))
 	if len(m.state.Nearby) == 0 {
-		lines = append(lines, "", mutedStyle.Render("Waiting for other yap clients..."))
+		lines = append(lines, "", mutedStyle.Render("Scanning..."))
 		return strings.Join(lines, "\n")
 	}
 	for i, peerInfo := range m.state.Nearby {
@@ -497,28 +489,81 @@ func (m *modelUI) renderNearby() string {
 		if i == m.nearbyIdx && m.focus == "nearby" {
 			label = selectedStyle.Render(label)
 		}
-		lines = append(lines, "", label)
-		lines = append(lines, mutedStyle.Render(shortID(peerInfo.PeerID)))
-		lines = append(lines, mutedStyle.Render("seen "+peerInfo.LastSeen.Format("15:04:05")))
+		lines = append(lines, "")
+		lines = append(lines, label)
+		lines = append(lines, mutedStyle.Render(shortID(peerInfo.PeerID)+"  seen "+peerInfo.LastSeen.Format("15:04")))
 	}
 	return strings.Join(lines, "\n")
 }
 
+// ---------------------------------------------------------------------------
+// Render: Chat
+// ---------------------------------------------------------------------------
+
+func (m *modelUI) renderChat(width, height int) string {
+	active := m.state.ActiveSwarm
+	if active == nil {
+		return ""
+	}
+
+	peerCount := len(m.state.Presence)
+	peerWord := "peers"
+	if peerCount == 1 {
+		peerWord = "peer"
+	}
+	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
+		titleStyle.Render(active.Name) +
+			mutedStyle.Render(fmt.Sprintf("  %d %s", peerCount, peerWord)) +
+			"  " + statusStyle.Render(m.status),
+	)
+
+	sidebarWidth := 26
+	mainWidth := width - sidebarWidth
+	if mainWidth < 30 {
+		mainWidth = width
+		sidebarWidth = 0
+	}
+	msgHeight := height - 11
+	if msgHeight < 8 {
+		msgHeight = 8
+	}
+	m.messages.SetWidth(mainWidth - 6)
+	m.messages.SetHeight(msgHeight)
+	m.composer.SetWidth(mainWidth - 6)
+	m.syncTranscript()
+
+	main := panelStyle.Width(mainWidth).Height(msgHeight + 6).Render(
+		m.messages.View() + "\n" + m.composer.View(),
+	)
+
+	body := main
+	if sidebarWidth > 0 {
+		peers := panelStyle.Width(sidebarWidth).Height(msgHeight + 6).Render(m.renderPresence())
+		body = lipgloss.JoinHorizontal(lipgloss.Top, main, peers)
+	}
+
+	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
+		mutedStyle.Render("enter send  ·  shift+enter newline  ·  esc back  ·  ctrl+c quit"),
+	)
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
 func (m *modelUI) renderPresence() string {
 	var lines []string
-	lines = append(lines, titleStyle.Render("Presence"))
-	lines = append(lines, mutedStyle.Render("Room members by heartbeat state."))
+	lines = append(lines, titleStyle.Render("Peers"))
 	if len(m.state.Presence) == 0 {
-		lines = append(lines, "", mutedStyle.Render("No presence data yet."))
+		lines = append(lines, "", mutedStyle.Render("No peers yet."))
 		return strings.Join(lines, "\n")
 	}
+	lines = append(lines, "")
 	for _, presence := range m.state.Presence {
-		lines = append(lines, "")
-		lines = append(lines, presenceStyle(presence.State).Render(presenceLabel(presence)))
-		lines = append(lines, mutedStyle.Render(shortID(presence.PeerID)))
-		if !presence.LastSeen.IsZero() {
-			lines = append(lines, mutedStyle.Render("seen "+presence.LastSeen.Format("15:04:05")))
+		name := presence.Name
+		if strings.TrimSpace(name) == "" {
+			name = shortID(presence.PeerID)
 		}
+		dot := presenceDot(presence.State)
+		lines = append(lines, dot+"  "+lipgloss.NewStyle().Foreground(colorStrong).Render(name))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -548,12 +593,16 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 	return strings.Join(lines, "\n\n")
 }
 
+// ---------------------------------------------------------------------------
+// Render: Modal
+// ---------------------------------------------------------------------------
+
 func (m *modelUI) renderModal(content string, width, height int) string {
 	boxWidth := width / 2
 	if boxWidth < 42 {
 		boxWidth = width - 8
 	}
-	box := panelStyle.Width(boxWidth).Render(m.modalBody())
+	box := modalStyle.Width(boxWidth).Render(m.modalBody())
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceChars(" "))
 }
 
@@ -567,21 +616,25 @@ func (m *modelUI) modalBody() string {
 		lines = append(lines, "")
 		lines = append(lines, m.prompt.View())
 		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("enter confirm  •  esc cancel"))
+		lines = append(lines, mutedStyle.Render("enter confirm  ·  esc cancel"))
 	case "invite":
 		if m.modal.Invite != nil {
 			lines = append(lines, "")
-			lines = append(lines, accentStyle.Render("Code: "+m.modal.Invite.Code))
-			lines = append(lines, mutedStyle.Render("Expires "+m.modal.Invite.ExpiresAt.Format(time.Kitchen)))
+			lines = append(lines, accentStyle.Render(m.modal.Invite.Code))
+			lines = append(lines, mutedStyle.Render("expires "+m.modal.Invite.ExpiresAt.Format(time.Kitchen)))
 		}
 		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("enter or esc closes this card"))
+		lines = append(lines, mutedStyle.Render("enter or esc to close"))
 	case "approval":
 		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("y accept  •  n reject"))
+		lines = append(lines, mutedStyle.Render("y accept  ·  n reject"))
 	}
 	return strings.Join(lines, "\n")
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 func (m *modelUI) selectedSwarm() *model.Swarm {
 	if len(m.state.Swarms) == 0 || m.swarmIdx < 0 || m.swarmIdx >= len(m.state.Swarms) {
@@ -600,7 +653,7 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 }
 
 func renderChatEntry(entry model.TranscriptEntry) string {
-	header := mutedStyle.Render(entry.SentAt.Format("15:04")) + " "
+	header := mutedStyle.Render(entry.SentAt.Format("15:04")) + "  "
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
@@ -625,23 +678,15 @@ func approvalMessage(event app.Event) string {
 		mutedStyle.Render("swarm "+event.Approval.SwarmName)
 }
 
-func presenceStyle(state string) lipgloss.Style {
+func presenceDot(state string) string {
 	switch state {
 	case "online":
-		return lipgloss.NewStyle().Foreground(colorJoin).Bold(true)
+		return lipgloss.NewStyle().Foreground(colorJoin).Render("●")
 	case "stale":
-		return lipgloss.NewStyle().Foreground(colorStale).Bold(true)
+		return lipgloss.NewStyle().Foreground(colorStale).Render("●")
 	default:
-		return lipgloss.NewStyle().Foreground(colorMuted)
+		return lipgloss.NewStyle().Foreground(colorMuted).Render("○")
 	}
-}
-
-func presenceLabel(presence model.Presence) string {
-	name := presence.Name
-	if strings.TrimSpace(name) == "" {
-		name = shortID(presence.PeerID)
-	}
-	return fmt.Sprintf("%s  [%s]", name, presence.State)
 }
 
 func nearbyLabel(peerInfo model.NearbyPeer) string {
