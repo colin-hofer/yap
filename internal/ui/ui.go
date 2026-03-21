@@ -29,8 +29,8 @@ var (
 	colorLeave   = lipgloss.Color("#FFB199")
 	colorStale   = lipgloss.Color("#E0BE75")
 
-	panelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
-	modalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
+	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
+	modalStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
 	titleStyle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 	accentStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
@@ -95,6 +95,11 @@ func newModel(service *app.Service) *modelUI {
 	composer.SetStyles(styles)
 	composer.Blur()
 
+	messages := viewport.New()
+	messages.SoftWrap = true
+	messages.MouseWheelEnabled = true
+	messages.MouseWheelDelta = 2
+
 	prompt := textinput.New()
 	prompt.Placeholder = "Type here"
 	prompt.Focus()
@@ -112,7 +117,7 @@ func newModel(service *app.Service) *modelUI {
 		mode:     mode,
 		focus:    "swarms",
 		status:   "ready",
-		messages: viewport.New(),
+		messages: messages,
 		composer: composer,
 		prompt:   prompt,
 	}
@@ -143,6 +148,13 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := waitForAppEvent(m.events)
 		m.applyAppEvent(msg)
 		return m, cmd
+	case tea.MouseWheelMsg:
+		if m.mode == "chat" && m.modal.Kind == "" {
+			var cmd tea.Cmd
+			m.messages, cmd = m.messages.Update(msg)
+			return m, cmd
+		}
+		return m, nil
 	case tea.KeyPressMsg:
 		if m.modal.Kind != "" {
 			return m.handleModal(msg)
@@ -177,6 +189,7 @@ func (m *modelUI) View() tea.View {
 	}
 	v := tea.NewView(base.Render(content))
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
@@ -252,6 +265,24 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.mode = "home"
 		m.composer.Blur()
 		return m, nil
+	case "pgup", "pageup":
+		m.messages.PageUp()
+		return m, nil
+	case "pgdown", "pagedown":
+		m.messages.PageDown()
+		return m, nil
+	case "home":
+		m.messages.GotoTop()
+		return m, nil
+	case "end":
+		m.messages.GotoBottom()
+		return m, nil
+	case "ctrl+u":
+		m.messages.HalfPageUp()
+		return m, nil
+	case "ctrl+d":
+		m.messages.HalfPageDown()
+		return m, nil
 	case "enter":
 		body := strings.TrimSpace(m.composer.Value())
 		if body == "" {
@@ -262,7 +293,7 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.composer.SetValue("")
-		m.syncTranscript()
+		m.syncTranscript(true)
 		return m, nil
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
@@ -412,13 +443,24 @@ func (m *modelUI) syncLayout() {
 		m.messages.SetWidth(chatWidth - 6)
 		m.messages.SetHeight(msgHeight)
 		m.composer.SetWidth(chatWidth - 6)
-		m.syncTranscript()
+		m.syncTranscript(false)
 	}
 }
 
-func (m *modelUI) syncTranscript() {
-	m.messages.SetContent(m.renderTranscript(m.state.Transcript, m.messages.Width()))
-	m.messages.GotoBottom()
+func (m *modelUI) syncTranscript(forceBottom bool) {
+	width := m.messages.Width()
+	if width <= 0 {
+		return
+	}
+	content := m.renderTranscript(m.state.Transcript, width)
+	wasAtBottom := forceBottom || m.messages.AtBottom()
+	offset := m.messages.YOffset()
+	m.messages.SetContent(content)
+	if wasAtBottom {
+		m.messages.GotoBottom()
+		return
+	}
+	m.messages.SetYOffset(offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,10 +572,9 @@ func (m *modelUI) renderChat(width, height int) string {
 	m.messages.SetWidth(mainWidth - 6)
 	m.messages.SetHeight(msgHeight)
 	m.composer.SetWidth(mainWidth - 6)
-	m.syncTranscript()
 
 	main := panelStyle.Width(mainWidth).Height(msgHeight + 6).Render(
-		m.messages.View() + "\n" + m.composer.View(),
+		m.messages.View() + "\n\n" + m.composer.View(),
 	)
 
 	body := main
@@ -543,7 +584,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
-		mutedStyle.Render("enter send  ·  shift+enter newline  ·  esc back  ·  ctrl+c quit"),
+		mutedStyle.Render("enter send  ·  shift+enter newline  ·  pgup/pgdn scroll  ·  esc back  ·  ctrl+c quit"),
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)

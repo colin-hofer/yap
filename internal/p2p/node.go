@@ -349,7 +349,6 @@ func (n *Node) OpenSwarm(swarm model.Swarm) error {
 	n.active = active
 	n.mu.Unlock()
 
-	n.emitSystem(fmt.Sprintf("opened swarm %q", swarm.Name))
 	n.emitPresenceSnapshot(active)
 	n.connectTrustedPeers(active.Swarm)
 	go n.subscriptionLoop(active)
