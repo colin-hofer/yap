@@ -7,9 +7,11 @@ The rewrite replaces the earlier custom UDP gossip design with libp2p:
 - peer identity: persisted Ed25519 keypair
 - local discovery: mDNS service name `yap-v2`
 - transport: libp2p host with default secure channels; current runtime defaults to TCP listeners, with QUIC kept as an experimental opt-in
-- group messaging: GossipSub topic per swarm
+- group messaging: one internal GossipSub channel per swarm (`yap/swarm/<swarm-id>/v2`)
 
 This reduces custom network code while keeping the app peer-to-peer and tolerant of churn.
+
+That channel is transport-only. Users do not create, browse, or manage "topics" in the UI; the user-facing concept is always a swarm.
 
 ## Security Model
 
@@ -53,6 +55,7 @@ the background while the app is running:
 
 - Home: saved swarms, nearby peers, unread activity, pending invites, and pairing prompts
 - Chat: selected swarm timeline, peer sidebar, status line, and multiline composer
+- The composer stays focused; the timeline is read-only and scrollable
 
 The UI only talks to the `internal/app` service. It never mutates persistence or libp2p state directly.
 

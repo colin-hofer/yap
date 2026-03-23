@@ -74,7 +74,7 @@ The implementation follows a layered design:
 
 - `internal/store`: persisted identity, swarm metadata, and local transcripts
 - `internal/crypto`: invite codes, room key generation, fingerprints, and AES-GCM helpers
-- `internal/p2p`: libp2p host setup, mDNS discovery, pairing streams, GossipSub topics, and presence
+- `internal/p2p`: libp2p host setup, mDNS discovery, pairing streams, room-scoped GossipSub channels, and presence
 - `internal/app`: application state, persistence integration, auto-join behavior, and UI-facing events
 - `internal/ui`: Bubble Tea interface for the home screen, pairing prompts, and the chat view
 
@@ -116,9 +116,12 @@ yap version
 
 - `enter`: send the current composer contents
 - `shift+enter`: insert a newline when the terminal supports key disambiguation
-- `tab`: switch focus between the transcript and composer
+- `tab`: complete an `@mention` while typing
+- `pgup` / `pgdn`: scroll the transcript
 - `esc`: leave the current chat and return to the home screen
 - `ctrl+c`: quit
+
+The chat view keeps focus in the composer. The transcript is read-only and can be scrolled with the keyboard or mouse.
 
 ## Persistence
 
@@ -131,6 +134,12 @@ Files:
 - `transcripts/<id>.jsonl`: retained transcript journal, reconciled with trusted peers when they are online, and compacted back to the most recent 1000 events
 
 All app-managed files are written with private permissions.
+
+## Internal Transport Detail
+
+`yap` does not have a user-facing "topic" feature.
+
+Internally, each swarm maps to a libp2p GossipSub channel named `yap/swarm/<swarm-id>/v2`. That channel is just the pubsub transport used to move encrypted chat and presence messages between trusted peers in the same swarm.
 
 ## Transport Note
 
