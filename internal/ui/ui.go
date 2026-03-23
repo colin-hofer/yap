@@ -1084,18 +1084,14 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 		// Consecutive chat messages from the same sender get collapsed.
 		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender
 
-		if !first {
-			if sameSender {
-				lines = append(lines, "")
-			} else {
-				lines = append(lines, "", "")
-			}
+		if !first && !sameSender {
+			lines = append(lines, "")
 		}
 		if !insertedUnread && !lastOpened.IsZero() && entry.SentAt.After(lastOpened) && !entry.Local {
 			if !first {
-				lines = append(lines, "", "")
+				lines = append(lines, "")
 			}
-			lines = append(lines, accentStyle.Render("── new messages ──"), "", "")
+			lines = append(lines, accentStyle.Render("── new messages ──"), "")
 			insertedUnread = true
 		}
 
