@@ -59,15 +59,6 @@ Once installed, `yap update` downloads the latest GitHub release for your curren
 4. On another machine, run `yap`, select the nearby peer, press `j`, and enter the code.
 5. Approve pairing on both sides and start chatting.
 
-## Goals
-
-- Zero-config local discovery on the same network
-- No central server or relay in v1
-- Stable device identity with saved trust
-- Shared room chat that tolerates peers joining, leaving, and reconnecting
-- Background swarm connections so saved swarms can continue receiving messages while you view another swarm or return home
-- A full-screen terminal UI that is usable without memorizing commands
-
 ## Architecture
 
 The implementation follows a layered design:
@@ -77,8 +68,6 @@ The implementation follows a layered design:
 - `internal/p2p`: libp2p host setup, mDNS discovery, pairing streams, room-scoped GossipSub channels, and presence
 - `internal/app`: application state, persistence integration, auto-join behavior, and UI-facing events
 - `internal/ui`: Bubble Tea interface for the home screen, pairing prompts, and the chat view
-
-`docs/approach.md` contains the protocol and persistence details used by the rewrite.
 
 ## User Model
 
@@ -135,13 +124,9 @@ Files:
 
 All app-managed files are written with private permissions.
 
-## Internal Transport Detail
-
-`yap` does not have a user-facing "topic" feature.
+## Transport Note
 
 Internally, each swarm maps to a libp2p GossipSub channel named `yap/swarm/<swarm-id>/v2`. That channel is just the pubsub transport used to move encrypted chat and presence messages between trusted peers in the same swarm.
-
-## Transport Note
 
 The current build defaults to TCP libp2p listeners for stability on Go 1.26.x. QUIC can be enabled experimentally with:
 
