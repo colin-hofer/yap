@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"yap/internal/model"
+	"yap/internal/p2p"
 )
 
 func TestHandleTranscriptEventTracksUnreadForUnselectedSwarm(t *testing.T) {
@@ -106,5 +107,33 @@ func TestFindSwarmLockedRejectsEmptyReference(t *testing.T) {
 	}
 	if _, ok := svc.findSwarmLocked("   "); ok {
 		t.Fatal("findSwarmLocked(\"   \") unexpectedly matched a swarm")
+	}
+}
+
+func TestHandleNodeEventNearbySnapshotReplacesPeers(t *testing.T) {
+	svc := &Service{
+		ctx:          context.Background(),
+		nearby:       map[string]model.NearbyPeer{"peer-old": {PeerID: "peer-old", Name: "Old"}},
+		events:       make(chan Event, 8),
+		unread:       make(map[string]int),
+		connected:    make(map[string]bool),
+		lastActivity: make(map[string]time.Time),
+	}
+
+	svc.handleNodeEvent(p2p.Event{
+		Kind: p2p.EventNearbySnapshot,
+		NearbyPeers: []model.NearbyPeer{
+			{PeerID: "peer-new", Name: "New"},
+		},
+	})
+
+	if got := len(svc.nearby); got != 1 {
+		t.Fatalf("len(nearby) = %d, want 1", got)
+	}
+	if _, ok := svc.nearby["peer-old"]; ok {
+		t.Fatal("peer-old still present after snapshot replacement")
+	}
+	if _, ok := svc.nearby["peer-new"]; !ok {
+		t.Fatal("peer-new missing after snapshot replacement")
 	}
 }

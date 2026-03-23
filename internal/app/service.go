@@ -237,6 +237,49 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 	return swarm, nil
 }
 
+// RenameIdentity updates the local display name and persists it.
+func (s *Service) RenameIdentity(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+
+	s.mu.RLock()
+	identity := s.identity
+	swarms := append([]model.Swarm(nil), s.swarms...)
+	s.mu.RUnlock()
+
+	identity.Name = name
+	self := model.TrustedPeer{
+		PeerID:      identity.PeerID,
+		Name:        identity.Name,
+		Fingerprint: identity.Fingerprint,
+	}
+	updatedSwarms := make([]model.Swarm, 0, len(swarms))
+	for _, swarm := range swarms {
+		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, self)
+		updatedSwarms = append(updatedSwarms, swarm)
+	}
+
+	if err := s.store.SaveIdentity(identity); err != nil {
+		return err
+	}
+	for _, swarm := range updatedSwarms {
+		if err := s.store.SaveSwarm(swarm); err != nil {
+			return err
+		}
+	}
+
+	s.node.UpdateIdentityName(identity.Name)
+
+	s.mu.Lock()
+	s.identity = identity
+	s.swarms = updatedSwarms
+	s.mu.Unlock()
+	s.emitSync()
+	return nil
+}
+
 // OpenSwarm selects a swarm and ensures it is connected in the background.
 func (s *Service) OpenSwarm(ref string) error {
 	swarm, err := s.findSwarm(ref)
@@ -373,14 +416,16 @@ func (s *Service) consumeNodeEvents() {
 
 func (s *Service) handleNodeEvent(event p2p.Event) {
 	switch event.Kind {
-	case p2p.EventNearby:
-		if event.Nearby == nil {
-			return
-		}
+	case p2p.EventNearbySnapshot:
 		s.mu.Lock()
-		s.nearby[event.Nearby.PeerID] = *event.Nearby
+		s.nearby = make(map[string]model.NearbyPeer, len(event.NearbyPeers))
+		for _, peerInfo := range event.NearbyPeers {
+			s.nearby[peerInfo.PeerID] = peerInfo
+		}
 		s.mu.Unlock()
-		s.maybeAutoJoin(event.Nearby.PeerID)
+		for _, peerInfo := range event.NearbyPeers {
+			s.maybeAutoJoin(peerInfo.PeerID)
+		}
 		s.emitSync()
 	case p2p.EventSystem:
 		if event.Message != "" {

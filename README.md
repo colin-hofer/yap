@@ -55,7 +55,7 @@ Once installed, `yap update` downloads the latest GitHub release for your curren
 
 1. Run `yap`.
 2. Press `n` to create a swarm and enter a name.
-3. Press `i` to generate an invite code.
+3. With the swarms list focused, press `i` to generate an invite code for the selected swarm.
 4. On another machine, run `yap`, select the nearby peer, press `j`, and enter the code.
 5. Approve pairing on both sides and start chatting.
 
@@ -103,20 +103,20 @@ yap version
 
 - `tab`: switch focus between saved swarms and nearby peers
 - `↑` / `↓`: move the selection in the focused list
-- `enter`: open the selected swarm
+- `enter`: open the selected swarm when the swarms list is focused
 - `n`: create a new swarm
-- `i`: generate an invite for the selected swarm
-- `j`: join a selected nearby peer with an invite code
-- `d`: remove the selected swarm locally
+- `r`: rename this device/user
+- `i`: generate an invite for the selected swarm when the swarms list is focused
+- `j`: join the selected nearby peer with an invite code when the nearby list is focused
+- `d`: remove the selected swarm locally when the swarms list is focused
 - `u`: quit the TUI and install the latest GitHub release for the current OS/arch
 - `q`: quit
 
 ## Chat Controls
 
 - `enter`: send the current composer contents
-- `shift+enter`: insert a newline
+- `shift+enter`: insert a newline when the terminal supports key disambiguation
 - `tab`: switch focus between the transcript and composer
-- `y`: copy the focused transcript entry
 - `esc`: leave the current chat and return to the home screen
 - `ctrl+c`: quit
 

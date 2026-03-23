@@ -85,8 +85,9 @@ type modelUI struct {
 	transcriptIdx int
 	status        string
 
-	updateRequested bool
-	checkingUpdate  bool
+	updateRequested   bool
+	checkingUpdate    bool
+	keyDisambiguation bool
 
 	messages viewport.Model
 	composer textarea.Model
@@ -197,10 +198,13 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.syncLayout()
 		return m, nil
+	case tea.KeyboardEnhancementsMsg:
+		m.keyDisambiguation = msg.SupportsKeyDisambiguation()
+		return m, nil
 	case app.Event:
 		cmd := waitForAppEvent(m.events)
-		m.applyAppEvent(msg)
-		return m, cmd
+		follow := m.applyAppEvent(msg)
+		return m, tea.Batch(cmd, follow)
 	case updateCheckMsg:
 		m.checkingUpdate = false
 		if msg.Err != nil {
@@ -240,7 +244,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.handleHome(msg)
 	}
-	if m.modal.Kind == "new" || m.modal.Kind == "join" {
+	if m.modal.Kind == "new" || m.modal.Kind == "join" || m.modal.Kind == "rename" {
 		var cmd tea.Cmd
 		m.prompt, cmd = m.prompt.Update(msg)
 		return m, cmd
@@ -308,6 +312,10 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.nearbyIdx++
 		}
 	case "enter":
+		if m.focus != "swarms" {
+			m.status = "focus swarms to open a room"
+			return m, nil
+		}
 		if swarm := m.selectedSwarm(); swarm != nil {
 			if err := m.service.OpenSwarm(swarm.Swarm.ID); err != nil {
 				m.status = err.Error()
@@ -318,7 +326,16 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.prompt.Placeholder = "Swarm name"
 		m.prompt.Focus()
 		m.modal = modalState{Kind: "new", Title: "Create Swarm", Message: "Name your new swarm."}
+	case "r":
+		m.prompt.SetValue(m.state.Identity.Name)
+		m.prompt.Placeholder = "Display name"
+		m.prompt.Focus()
+		m.modal = modalState{Kind: "rename", Title: "Rename Yourself", Message: "Update the name nearby peers and swarms see for this device."}
 	case "i":
+		if m.focus != "swarms" {
+			m.status = "focus swarms to invite a room"
+			return m, nil
+		}
 		swarm := m.selectedSwarm()
 		if swarm == nil {
 			m.status = "select a swarm first"
@@ -328,6 +345,10 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = err.Error()
 		}
 	case "d":
+		if m.focus != "swarms" {
+			m.status = "focus swarms to remove a room"
+			return m, nil
+		}
 		swarm := m.selectedSwarm()
 		if swarm == nil {
 			m.status = "select a swarm first"
@@ -341,6 +362,10 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			SwarmName: swarm.Swarm.Name,
 		}
 	case "j":
+		if m.focus != "nearby" {
+			m.status = "focus nearby to join with a code"
+			return m, nil
+		}
 		if m.selectedNearby() == nil {
 			m.status = "select a nearby peer first"
 			return m, nil
@@ -411,15 +436,6 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+d":
 		m.messages.HalfPageDown()
 		return m, nil
-	case "y":
-		if m.focus == "transcript" {
-			entry := m.focusedTranscriptEntry()
-			if entry == nil {
-				m.status = "no message selected"
-				return m, nil
-			}
-			return m, copyTranscriptCmd(*entry)
-		}
 	case "enter":
 		if m.focus == "transcript" {
 			return m, nil
@@ -451,8 +467,15 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleCreateSwarmModal(msg)
 	case "join":
 		return m.handleJoinModal(msg)
+	case "rename":
+		return m.handleRenameModal(msg)
 	case "invite":
-		if msg.String() == "esc" || msg.String() == "enter" || msg.String() == " " {
+		switch msg.String() {
+		case "y", "c":
+			if m.modal.Invite != nil {
+				return m, copyInviteCmd(*m.modal.Invite)
+			}
+		case "esc", "enter", " ":
 			m.modal = modalState{}
 		}
 		return m, nil
@@ -521,6 +544,25 @@ func (m *modelUI) handleCreateSwarmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 	return m, cmd
 }
 
+func (m *modelUI) handleRenameModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.modal = modalState{}
+		return m, nil
+	case "enter":
+		if err := m.service.RenameIdentity(m.prompt.Value()); err != nil {
+			m.status = err.Error()
+			return m, nil
+		}
+		m.modal = modalState{}
+		m.status = "updated display name"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.prompt, cmd = m.prompt.Update(msg)
+	return m, cmd
+}
+
 func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -549,11 +591,11 @@ func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // Event handling
 // ---------------------------------------------------------------------------
 
-func (m *modelUI) applyAppEvent(event app.Event) {
+func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 	switch event.Type {
 	case app.EventSync:
 		if event.Snapshot.Version < m.state.Version {
-			return
+			return nil
 		}
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
@@ -580,28 +622,40 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 			m.transcriptIdx = 0
 		}
 		m.syncLayout()
+		return nil
 	case app.EventToast:
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
 		m.status = event.Message
 		m.syncLayout()
+		return nil
 	case app.EventInvite:
 		if event.Snapshot.Version < m.state.Version {
-			return
+			return nil
 		}
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
+		title := "Invite Ready"
+		message := "Share this code with a nearby peer."
+		if event.Invite != nil {
+			title = "Invite " + event.Invite.SwarmName
+			message = fmt.Sprintf("Share this code to invite someone into %s.", event.Invite.SwarmName)
+		}
 		m.modal = modalState{
 			Kind:    "invite",
-			Title:   "Invite Ready",
-			Message: "Share this code with a nearby peer.",
+			Title:   title,
+			Message: message,
 			Invite:  event.Invite,
 		}
+		if event.Invite != nil {
+			return copyInviteCmd(*event.Invite)
+		}
+		return nil
 	case app.EventApproval:
 		if event.Snapshot.Version < m.state.Version {
-			return
+			return nil
 		}
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
@@ -612,7 +666,9 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 			Message:  approvalMessage(event),
 			Approval: &event,
 		}
+		return nil
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +747,7 @@ func (m *modelUI) renderHome(width, height int) string {
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
 		statusStyle.Render(m.status) + "\n" +
-			mutedStyle.Render("tab focus · ↑↓ select · enter open · n new · i invite · j join · d remove · u update · q quit"),
+			mutedStyle.Render(m.homeFooterHelp()),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
@@ -809,7 +865,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
-		mutedStyle.Render("tab focus · enter send · shift+enter newline · y copy · pgup/pgdn scroll · esc back"),
+		mutedStyle.Render(m.chatFooterHelp()),
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -887,7 +943,7 @@ func (m *modelUI) modalBody() string {
 	lines = append(lines, "")
 	lines = append(lines, m.modal.Message)
 	switch m.modal.Kind {
-	case "new", "join":
+	case "new", "join", "rename":
 		lines = append(lines, "")
 		lines = append(lines, m.prompt.View())
 		lines = append(lines, "")
@@ -899,7 +955,7 @@ func (m *modelUI) modalBody() string {
 			lines = append(lines, mutedStyle.Render("expires "+m.modal.Invite.ExpiresAt.Format(time.Kitchen)))
 		}
 		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("enter or esc to close"))
+		lines = append(lines, mutedStyle.Render("y/c copy  ·  enter/esc close"))
 	case "approval":
 		lines = append(lines, "")
 		lines = append(lines, mutedStyle.Render("y accept  ·  n reject"))
@@ -975,38 +1031,40 @@ func renderTranscriptEntryPlain(entry model.TranscriptEntry) string {
 	}
 }
 
-func (m *modelUI) focusedTranscriptEntry() *model.TranscriptEntry {
-	if len(m.state.Transcript) == 0 || m.transcriptIdx < 0 || m.transcriptIdx >= len(m.state.Transcript) {
-		return nil
-	}
-	entry := m.state.Transcript[m.transcriptIdx]
-	return &entry
+func copyInviteCmd(invite model.Invite) tea.Cmd {
+	return copyTextCmd(invite.Code, "copied invite code")
 }
 
-func copyTranscriptCmd(entry model.TranscriptEntry) tea.Cmd {
-	text := copyTranscriptText(entry)
+func copyTextCmd(text, status string) tea.Cmd {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
 	return tea.Batch(
 		func() tea.Msg {
-			if err := clipboard.WriteAll(text); err == nil {
-				return copyResultMsg{Message: "copied message"}
-			}
-			return copyResultMsg{Message: "copied message"}
+			_ = clipboard.WriteAll(text)
+			return copyResultMsg{Message: status}
 		},
 		tea.SetClipboard(text),
 	)
 }
 
-func copyTranscriptText(entry model.TranscriptEntry) string {
-	switch entry.Kind {
-	case "chat":
-		return fmt.Sprintf("%s %s\n%s", entry.SentAt.Format("15:04"), entry.SenderName, entry.Body)
-	case "join":
-		return fmt.Sprintf("%s joined", entry.SenderName)
-	case "leave":
-		return fmt.Sprintf("%s left", entry.SenderName)
-	default:
-		return entry.Body
+func (m *modelUI) homeFooterHelp() string {
+	if m.focus == "nearby" {
+		return "tab swarms · ↑↓ select · n new swarm · j join selected nearby · r rename self · u update · q quit"
 	}
+	return "tab nearby · ↑↓ select · enter open swarm · n new swarm · r rename self · i invite selected swarm · d remove selected swarm · u update · q quit"
+}
+
+func (m *modelUI) chatFooterHelp() string {
+	parts := []string{"tab focus", "enter send"}
+	if m.keyDisambiguation {
+		parts = append(parts, "shift+enter newline")
+	} else {
+		parts = append(parts, "multiline unavailable in this terminal")
+	}
+	parts = append(parts, "pgup/pgdn scroll", "esc back")
+	return strings.Join(parts, " · ")
 }
 
 func swarmDot(swarm app.SwarmSummary) string {
