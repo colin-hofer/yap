@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
+
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
@@ -73,11 +75,12 @@ type modelUI struct {
 	width  int
 	height int
 
-	mode      string
-	focus     string
-	swarmIdx  int
-	nearbyIdx int
-	status    string
+	mode          string
+	focus         string
+	swarmIdx      int
+	nearbyIdx     int
+	transcriptIdx int
+	status        string
 
 	updateRequested bool
 	checkingUpdate  bool
@@ -89,16 +92,22 @@ type modelUI struct {
 }
 
 type modalState struct {
-	Kind     string
-	Title    string
-	Message  string
-	Approval *app.Event
-	Invite   *model.Invite
+	Kind      string
+	Title     string
+	Message   string
+	Approval  *app.Event
+	Invite    *model.Invite
+	SwarmID   string
+	SwarmName string
 }
 
 type updateCheckMsg struct {
 	Result update.Result
 	Err    error
+}
+
+type copyResultMsg struct {
+	Message string
 }
 
 func newModel(service *app.Service) *modelUI {
@@ -129,8 +138,10 @@ func newModel(service *app.Service) *modelUI {
 
 	state := service.Snapshot()
 	mode := "home"
-	if state.ActiveSwarm != nil {
+	focus := "swarms"
+	if state.SelectedSwarm != nil {
 		mode = "chat"
+		focus = "composer"
 		composer.Focus()
 	}
 	return &modelUI{
@@ -138,7 +149,7 @@ func newModel(service *app.Service) *modelUI {
 		state:    state,
 		events:   service.Events(),
 		mode:     mode,
-		focus:    "swarms",
+		focus:    focus,
 		status:   "ready",
 		messages: messages,
 		composer: composer,
@@ -207,6 +218,9 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			),
 		}
 		return m, nil
+	case copyResultMsg:
+		m.status = msg.Message
+		return m, nil
 	case tea.MouseWheelMsg:
 		if m.mode == "chat" && m.modal.Kind == "" {
 			var cmd tea.Cmd
@@ -223,6 +237,16 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.handleHome(msg)
 	}
+	if m.modal.Kind == "new" || m.modal.Kind == "join" {
+		var cmd tea.Cmd
+		m.prompt, cmd = m.prompt.Update(msg)
+		return m, cmd
+	}
+	if m.mode == "chat" && m.focus != "transcript" {
+		var cmd tea.Cmd
+		m.composer, cmd = m.composer.Update(msg)
+		return m, cmd
+	}
 	return m, nil
 }
 
@@ -238,7 +262,7 @@ func (m *modelUI) View() tea.View {
 
 	base := lipgloss.NewStyle().Foreground(colorStrong).Width(width).Height(height)
 	var content string
-	if m.mode == "chat" && m.state.ActiveSwarm != nil {
+	if m.mode == "chat" && m.state.SelectedSwarm != nil {
 		content = m.renderChat(width, height)
 	} else {
 		content = m.renderHome(width, height)
@@ -282,7 +306,7 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if swarm := m.selectedSwarm(); swarm != nil {
-			if err := m.service.OpenSwarm(swarm.ID); err != nil {
+			if err := m.service.OpenSwarm(swarm.Swarm.ID); err != nil {
 				m.status = err.Error()
 			}
 		}
@@ -297,8 +321,21 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = "select a swarm first"
 			return m, nil
 		}
-		if _, err := m.service.GenerateInvite(swarm.ID); err != nil {
+		if _, err := m.service.GenerateInvite(swarm.Swarm.ID); err != nil {
 			m.status = err.Error()
+		}
+	case "d":
+		swarm := m.selectedSwarm()
+		if swarm == nil {
+			m.status = "select a swarm first"
+			return m, nil
+		}
+		m.modal = modalState{
+			Kind:      "remove",
+			Title:     "Remove Swarm",
+			Message:   fmt.Sprintf("Forget %s on this device and delete its local transcript?", swarm.Swarm.Name),
+			SwarmID:   swarm.Swarm.ID,
+			SwarmName: swarm.Swarm.Name,
 		}
 	case "j":
 		if m.selectedNearby() == nil {
@@ -329,8 +366,30 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = err.Error()
 		}
 		m.mode = "home"
+		m.focus = "swarms"
 		m.composer.Blur()
 		return m, nil
+	case "tab":
+		if m.focus == "composer" {
+			m.focus = "transcript"
+			m.composer.Blur()
+		} else {
+			m.focus = "composer"
+			m.composer.Focus()
+		}
+		return m, nil
+	case "up":
+		if m.focus == "transcript" && m.transcriptIdx > 0 {
+			m.transcriptIdx--
+			m.syncTranscript(false)
+			return m, nil
+		}
+	case "down":
+		if m.focus == "transcript" && m.transcriptIdx < len(m.state.Transcript)-1 {
+			m.transcriptIdx++
+			m.syncTranscript(false)
+			return m, nil
+		}
 	case "pgup", "pageup":
 		m.messages.PageUp()
 		return m, nil
@@ -349,7 +408,32 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+d":
 		m.messages.HalfPageDown()
 		return m, nil
+	case "y":
+		if m.focus == "transcript" {
+			entry := m.focusedTranscriptEntry()
+			if entry == nil {
+				m.status = "no message selected"
+				return m, nil
+			}
+			return m, copyTranscriptCmd(*entry)
+		}
+	case "d":
+		if m.state.SelectedSwarm == nil {
+			m.status = "no swarm selected"
+			return m, nil
+		}
+		m.modal = modalState{
+			Kind:      "remove",
+			Title:     "Remove Swarm",
+			Message:   fmt.Sprintf("Forget %s on this device and delete its local transcript?", m.state.SelectedSwarm.Name),
+			SwarmID:   m.state.SelectedSwarm.ID,
+			SwarmName: m.state.SelectedSwarm.Name,
+		}
+		return m, nil
 	case "enter":
+		if m.focus == "transcript" {
+			return m, nil
+		}
 		body := strings.TrimSpace(m.composer.Value())
 		if body == "" {
 			return m, nil
@@ -360,6 +444,9 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.composer.SetValue("")
 		m.syncTranscript(true)
+		return m, nil
+	}
+	if m.focus == "transcript" {
 		return m, nil
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
@@ -390,6 +477,19 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if m.modal.Approval != nil && m.modal.Approval.Approval != nil {
 				_ = m.service.ResolveApproval(m.modal.Approval.Approval.ID, false)
 			}
+			m.modal = modalState{}
+		}
+		return m, nil
+	case "remove":
+		switch msg.String() {
+		case "y", "enter":
+			if err := m.service.RemoveSwarm(m.modal.SwarmID); err != nil {
+				m.status = err.Error()
+			} else {
+				m.status = fmt.Sprintf("removed %s locally", m.modal.SwarmName)
+			}
+			m.modal = modalState{}
+		case "n", "esc":
 			m.modal = modalState{}
 		}
 		return m, nil
@@ -462,12 +562,19 @@ func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *modelUI) applyAppEvent(event app.Event) {
 	switch event.Type {
 	case app.EventSync:
+		if event.Snapshot.Version < m.state.Version {
+			return
+		}
 		m.state = event.Snapshot
-		if m.state.ActiveSwarm != nil {
+		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
+			if m.focus != "transcript" {
+				m.focus = "composer"
+			}
 			m.composer.Focus()
 		} else {
 			m.mode = "home"
+			m.focus = "swarms"
 			m.composer.Blur()
 		}
 		if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
@@ -476,13 +583,26 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 		if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
 			m.nearbyIdx = len(m.state.Nearby) - 1
 		}
+		if m.transcriptIdx >= len(m.state.Transcript) && len(m.state.Transcript) > 0 {
+			m.transcriptIdx = len(m.state.Transcript) - 1
+		}
+		if len(m.state.Transcript) == 0 {
+			m.transcriptIdx = 0
+		}
 		m.syncLayout()
 	case app.EventToast:
-		m.state = event.Snapshot
+		if event.Snapshot.Version >= m.state.Version {
+			m.state = event.Snapshot
+		}
 		m.status = event.Message
 		m.syncLayout()
 	case app.EventInvite:
-		m.state = event.Snapshot
+		if event.Snapshot.Version < m.state.Version {
+			return
+		}
+		if event.Snapshot.Version >= m.state.Version {
+			m.state = event.Snapshot
+		}
 		m.modal = modalState{
 			Kind:    "invite",
 			Title:   "Invite Ready",
@@ -490,7 +610,12 @@ func (m *modelUI) applyAppEvent(event app.Event) {
 			Invite:  event.Invite,
 		}
 	case app.EventApproval:
-		m.state = event.Snapshot
+		if event.Snapshot.Version < m.state.Version {
+			return
+		}
+		if event.Snapshot.Version >= m.state.Version {
+			m.state = event.Snapshot
+		}
 		m.modal = modalState{
 			Kind:     "approval",
 			Title:    "Approve Pairing",
@@ -569,7 +694,7 @@ func (m *modelUI) renderHome(width, height int) string {
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
 		statusStyle.Render(m.status) + "\n" +
-			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  u update  ·  q quit"),
+			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  d remove  ·  u update  ·  q quit"),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
@@ -582,15 +707,18 @@ func (m *modelUI) renderSwarms() string {
 		return strings.Join(lines, "\n")
 	}
 	for i, swarm := range m.state.Swarms {
-		label := fmt.Sprintf("%s  %s", swarm.Name, mutedStyle.Render(shortID(swarm.ID)))
+		label := fmt.Sprintf("%s%s  %s", swarmStatus(swarm), swarm.Swarm.Name, mutedStyle.Render(shortID(swarm.Swarm.ID)))
 		if i == m.swarmIdx && m.focus == "swarms" {
 			label = selectedStyle.Render(label)
 		}
 		lines = append(lines, "")
 		lines = append(lines, label)
-		meta := fmt.Sprintf("%d peers", len(swarm.TrustedPeers))
-		if !swarm.LastOpened.IsZero() {
-			meta += " · " + swarm.LastOpened.Format("Jan 2 15:04")
+		meta := fmt.Sprintf("%d peers", len(swarm.Swarm.TrustedPeers))
+		if swarm.Unread > 0 {
+			meta += fmt.Sprintf(" · %d unread", swarm.Unread)
+		}
+		if !swarm.LastActivity.IsZero() {
+			meta += " · " + swarm.LastActivity.Format("Jan 2 15:04")
 		}
 		lines = append(lines, mutedStyle.Render(meta))
 	}
@@ -621,7 +749,7 @@ func (m *modelUI) renderNearby() string {
 // ---------------------------------------------------------------------------
 
 func (m *modelUI) renderChat(width, height int) string {
-	active := m.state.ActiveSwarm
+	active := m.state.SelectedSwarm
 	if active == nil {
 		return ""
 	}
@@ -651,18 +779,20 @@ func (m *modelUI) renderChat(width, height int) string {
 	m.messages.SetHeight(msgHeight)
 	m.composer.SetWidth(mainWidth - 6)
 
-	main := panelStyle.Width(mainWidth).Height(msgHeight + 6).Render(
+	panelHeight := msgHeight + 4 // viewport + gap + composer fits exactly; layout totals to terminal height
+
+	main := panelStyle.Width(mainWidth).Height(panelHeight).Render(
 		m.messages.View() + "\n\n" + m.composer.View(),
 	)
 
 	body := main
 	if sidebarWidth > 0 {
-		peers := panelStyle.Width(sidebarWidth).Height(msgHeight + 6).Render(m.renderPresence())
+		peers := panelStyle.Width(sidebarWidth).Height(panelHeight).Render(m.renderPresence())
 		body = lipgloss.JoinHorizontal(lipgloss.Top, main, peers)
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
-		mutedStyle.Render("enter send  ·  shift+enter newline  ·  pgup/pgdn scroll  ·  esc back  ·  ctrl+c quit"),
+		mutedStyle.Render("tab focus  ·  enter send  ·  shift+enter newline  ·  y copy  ·  pgup/pgdn scroll  ·  d remove  ·  esc back  ·  ctrl+c quit"),
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -695,17 +825,17 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 	if len(entries) == 0 {
 		lines = append(lines, mutedStyle.Render("No messages yet."))
 	}
-	for _, entry := range entries {
+	for i, entry := range entries {
+		block := renderTranscriptEntry(entry)
+		if i == m.transcriptIdx && m.focus == "transcript" {
+			block = selectedStyle.Render(block)
+		}
 		switch entry.Kind {
-		case "chat":
-			lines = append(lines, renderChatEntry(entry))
-		case "join":
-			lines = append(lines, lipgloss.NewStyle().Foreground(colorJoin).Render(fmt.Sprintf("%s joined", entry.SenderName)))
-		case "leave":
-			lines = append(lines, lipgloss.NewStyle().Foreground(colorLeave).Render(fmt.Sprintf("%s left", entry.SenderName)))
+		case "chat", "join", "leave":
+			lines = append(lines, block)
 		default:
 			if strings.TrimSpace(entry.Body) != "" {
-				lines = append(lines, mutedStyle.Render(entry.Body))
+				lines = append(lines, block)
 			}
 		}
 	}
@@ -750,6 +880,10 @@ func (m *modelUI) modalBody() string {
 	case "update":
 		lines = append(lines, "")
 		lines = append(lines, mutedStyle.Render("enter/y confirm  ·  esc/n cancel"))
+	case "remove":
+		lines = append(lines, "")
+		lines = append(lines, dangerStyle.Render("local only"))
+		lines = append(lines, mutedStyle.Render("enter/y confirm  ·  esc/n cancel"))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -758,7 +892,7 @@ func (m *modelUI) modalBody() string {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func (m *modelUI) selectedSwarm() *model.Swarm {
+func (m *modelUI) selectedSwarm() *app.SwarmSummary {
 	if len(m.state.Swarms) == 0 || m.swarmIdx < 0 || m.swarmIdx >= len(m.state.Swarms) {
 		return nil
 	}
@@ -783,6 +917,63 @@ func renderChatEntry(entry model.TranscriptEntry) string {
 		bodyStyle = lipgloss.NewStyle().Foreground(colorSelf)
 	}
 	return header + nameStyle.Render(entry.SenderName) + "\n" + bodyStyle.Render(entry.Body)
+}
+
+func renderTranscriptEntry(entry model.TranscriptEntry) string {
+	switch entry.Kind {
+	case "chat":
+		return renderChatEntry(entry)
+	case "join":
+		return lipgloss.NewStyle().Foreground(colorJoin).Render(fmt.Sprintf("%s joined", entry.SenderName))
+	case "leave":
+		return lipgloss.NewStyle().Foreground(colorLeave).Render(fmt.Sprintf("%s left", entry.SenderName))
+	default:
+		if strings.TrimSpace(entry.Body) != "" {
+			return mutedStyle.Render(entry.Body)
+		}
+		return ""
+	}
+}
+
+func (m *modelUI) focusedTranscriptEntry() *model.TranscriptEntry {
+	if len(m.state.Transcript) == 0 || m.transcriptIdx < 0 || m.transcriptIdx >= len(m.state.Transcript) {
+		return nil
+	}
+	entry := m.state.Transcript[m.transcriptIdx]
+	return &entry
+}
+
+func copyTranscriptCmd(entry model.TranscriptEntry) tea.Cmd {
+	text := copyTranscriptText(entry)
+	return tea.Batch(
+		func() tea.Msg {
+			if err := clipboard.WriteAll(text); err == nil {
+				return copyResultMsg{Message: "copied message"}
+			}
+			return copyResultMsg{Message: "copied message"}
+		},
+		tea.SetClipboard(text),
+	)
+}
+
+func copyTranscriptText(entry model.TranscriptEntry) string {
+	switch entry.Kind {
+	case "chat":
+		return fmt.Sprintf("%s %s\n%s", entry.SentAt.Format("15:04"), entry.SenderName, entry.Body)
+	case "join":
+		return fmt.Sprintf("%s joined", entry.SenderName)
+	case "leave":
+		return fmt.Sprintf("%s left", entry.SenderName)
+	default:
+		return entry.Body
+	}
+}
+
+func swarmStatus(swarm app.SwarmSummary) string {
+	if swarm.Connected {
+		return lipgloss.NewStyle().Foreground(colorJoin).Render("● ")
+	}
+	return lipgloss.NewStyle().Foreground(colorMuted).Render("○ ")
 }
 
 func approvalMessage(event app.Event) string {

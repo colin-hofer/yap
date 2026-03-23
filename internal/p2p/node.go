@@ -24,18 +24,21 @@ import (
 
 	yapcrypto "yap/internal/crypto"
 	"yap/internal/model"
+	"yap/internal/store"
 )
 
 const (
-	mdnsServiceName  = "yap-v1"
-	cardProtocolID   = protocol.ID("/yap/card/1")
-	pairProtocolID   = protocol.ID("/yap/pair/1")
-	heartbeatEvery   = 15 * time.Second
-	staleAfter       = 45 * time.Second
-	offlineAfter     = 90 * time.Second
-	reconnectEvery   = 20 * time.Second
-	inviteTTL        = 5 * time.Minute
-	defaultInviteUse = 5
+	mdnsServiceName   = "yap-v1"
+	cardProtocolID    = protocol.ID("/yap/card/1")
+	pairProtocolID    = protocol.ID("/yap/pair/1")
+	historyProtocolID = protocol.ID("/yap/history/1")
+	heartbeatEvery    = 15 * time.Second
+	staleAfter        = 45 * time.Second
+	offlineAfter      = 90 * time.Second
+	reconnectEvery    = 20 * time.Second
+	historyCooldown   = 1 * time.Minute
+	inviteTTL         = 5 * time.Minute
+	defaultInviteUse  = 5
 )
 
 // EventKind is a UI-facing classification for node events.
@@ -47,17 +50,20 @@ const (
 	EventApproval     EventKind = "approval"
 	EventPairComplete EventKind = "pair_complete"
 	EventTranscript   EventKind = "transcript"
+	EventHistory      EventKind = "history"
 	EventPresence     EventKind = "presence"
 )
 
 // Event describes a state change from the node.
 type Event struct {
 	Kind     EventKind
+	SwarmID  string
 	Message  string
 	Nearby   *model.NearbyPeer
 	Approval *Approval
 	Pair     *PairResult
 	Entry    *model.TranscriptEntry
+	Entries  []model.TranscriptEntry
 	Presence []model.Presence
 	AutoOpen bool
 }
@@ -84,16 +90,18 @@ type Node struct {
 	host     host.Host
 	pubsub   *pubsub.PubSub
 	identity model.Identity
+	store    *store.Store
 
 	events chan Event
 
-	mu      sync.RWMutex
-	nearby  map[string]model.NearbyPeer
-	invites map[string]*activeInvite
-	pending map[string]chan bool
-	active  *activeSwarm
-	closed  bool
-	seen    map[string]struct{}
+	mu          sync.RWMutex
+	nearby      map[string]model.NearbyPeer
+	invites     map[string]*activeInvite
+	pending     map[string]chan bool
+	active      map[string]*activeSwarm
+	closed      bool
+	seen        map[string]struct{}
+	historySync map[string]time.Time
 }
 
 type activeInvite struct {
@@ -169,7 +177,7 @@ type envelopeBody struct {
 }
 
 // New creates a node with a persisted identity.
-func New(parent context.Context, identity model.Identity) (*Node, error) {
+func New(parent context.Context, identity model.Identity, st *store.Store) (*Node, error) {
 	ctx, cancel := context.WithCancel(parent)
 
 	privateKeyBytes, err := corecrypto.ConfigDecodeKey(identity.PrivateKey)
@@ -200,20 +208,24 @@ func New(parent context.Context, identity model.Identity) (*Node, error) {
 	}
 
 	node := &Node{
-		ctx:      ctx,
-		cancel:   cancel,
-		host:     h,
-		pubsub:   ps,
-		identity: identity,
-		events:   make(chan Event, 256),
-		nearby:   make(map[string]model.NearbyPeer),
-		invites:  make(map[string]*activeInvite),
-		pending:  make(map[string]chan bool),
-		seen:     make(map[string]struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		host:        h,
+		pubsub:      ps,
+		identity:    identity,
+		store:       st,
+		events:      make(chan Event, 256),
+		nearby:      make(map[string]model.NearbyPeer),
+		invites:     make(map[string]*activeInvite),
+		pending:     make(map[string]chan bool),
+		active:      make(map[string]*activeSwarm),
+		seen:        make(map[string]struct{}),
+		historySync: make(map[string]time.Time),
 	}
 
 	h.SetStreamHandler(cardProtocolID, node.handleCardStream)
 	h.SetStreamHandler(pairProtocolID, node.handlePairStream)
+	h.SetStreamHandler(historyProtocolID, node.handleHistoryStream)
 
 	service := mdns.NewMdnsService(h, mdnsServiceName, &discoveryNotifee{node: node})
 	if err := service.Start(); err != nil {
@@ -302,8 +314,13 @@ func (n *Node) PairWithPeer(peerID, code string, autoOpen bool) error {
 
 // OpenSwarm joins the room topic and begins presence/publication loops.
 func (n *Node) OpenSwarm(swarm model.Swarm) error {
-	if err := n.CloseSwarm(); err != nil {
-		return err
+	if active := n.currentSwarm(swarm.ID); active != nil {
+		if sameSwarmSession(active.Swarm, swarm) {
+			return nil
+		}
+		if err := n.CloseSwarm(swarm.ID); err != nil {
+			return err
+		}
 	}
 	topicName := topicName(swarm.ID)
 	topic, err := n.pubsub.Join(topicName)
@@ -346,7 +363,7 @@ func (n *Node) OpenSwarm(swarm model.Swarm) error {
 		n.addTrustedPeerAddrs(trusted)
 	}
 	n.mu.Lock()
-	n.active = active
+	n.active[swarm.ID] = active
 	n.mu.Unlock()
 
 	n.emitPresenceSnapshot(active)
@@ -355,17 +372,18 @@ func (n *Node) OpenSwarm(swarm model.Swarm) error {
 	go n.heartbeatLoop(active)
 	go n.reconnectLoop(active)
 	go n.presenceLoop(active)
+	go n.syncSwarm(active)
 	if err := n.publishEnvelope(active, "join", ""); err != nil {
 		n.emitSystem(fmt.Sprintf("failed to publish join: %v", err))
 	}
 	return nil
 }
 
-// CloseSwarm leaves the current room if one is active.
-func (n *Node) CloseSwarm() error {
+// CloseSwarm leaves the given room if it is active.
+func (n *Node) CloseSwarm(swarmID string) error {
 	n.mu.Lock()
-	active := n.active
-	n.active = nil
+	active := n.active[swarmID]
+	delete(n.active, swarmID)
 	n.mu.Unlock()
 	if active == nil {
 		return nil
@@ -379,15 +397,37 @@ func (n *Node) CloseSwarm() error {
 	return nil
 }
 
-// PublishChat encrypts and publishes a chat message to the active swarm.
-func (n *Node) PublishChat(body string) error {
+// CloseAllSwarms leaves all active rooms.
+func (n *Node) CloseAllSwarms() error {
+	n.mu.Lock()
+	active := make([]*activeSwarm, 0, len(n.active))
+	for swarmID, session := range n.active {
+		active = append(active, session)
+		delete(n.active, swarmID)
+	}
+	n.mu.Unlock()
+
+	var closeErr error
+	for _, session := range active {
+		_ = n.publishEnvelope(session, "leave", "")
+		session.Cancel()
+		session.Sub.Cancel()
+		if err := session.Topic.Close(); err != nil && closeErr == nil {
+			closeErr = fmt.Errorf("close topic: %w", err)
+		}
+	}
+	return closeErr
+}
+
+// PublishChat encrypts and publishes a chat message to the given swarm.
+func (n *Node) PublishChat(swarmID, body string) error {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return nil
 	}
-	active := n.currentActive()
+	active := n.currentSwarm(swarmID)
 	if active == nil {
-		return fmt.Errorf("no swarm is open")
+		return fmt.Errorf("swarm %q is not connected", swarmID)
 	}
 	if err := n.publishEnvelope(active, "chat", body); err != nil {
 		return err
@@ -416,7 +456,7 @@ func (n *Node) Close() error {
 	}
 	n.closed = true
 	n.mu.Unlock()
-	_ = n.CloseSwarm()
+	_ = n.CloseAllSwarms()
 	n.cancel()
 	return n.host.Close()
 }
@@ -741,6 +781,7 @@ func (n *Node) reconnectLoop(active *activeSwarm) {
 			return
 		case <-ticker.C:
 			n.connectTrustedPeers(active.Swarm)
+			go n.syncSwarm(active)
 		}
 	}
 }
@@ -821,6 +862,7 @@ func (n *Node) connectTrustedPeers(swarm model.Swarm) {
 func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 	n.mu.Lock()
 	record, ok := active.Presence[update.PeerID]
+	previousState := ""
 	if !ok {
 		record = &presenceRecord{
 			PeerID:      update.PeerID,
@@ -828,6 +870,8 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 			Fingerprint: update.Fingerprint,
 		}
 		active.Presence[update.PeerID] = record
+	} else {
+		previousState = record.State
 	}
 	if update.Name != "" {
 		record.Name = update.Name
@@ -843,6 +887,9 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 	}
 	n.mu.Unlock()
 	n.emitPresenceSnapshot(active)
+	if update.PeerID != n.host.ID().String() && update.State == "online" && previousState != "online" {
+		go n.syncSwarm(active)
+	}
 }
 
 func (n *Node) refreshPresence(active *activeSwarm) {
@@ -891,7 +938,7 @@ func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
 		}
 		return presenceRank(presence[i].State) < presenceRank(presence[j].State)
 	})
-	n.emit(Event{Kind: EventPresence, Presence: presence})
+	n.emit(Event{Kind: EventPresence, SwarmID: active.Swarm.ID, Presence: presence})
 }
 
 func (n *Node) addTrustedPeerAddrs(trusted model.TrustedPeer) {
@@ -913,10 +960,10 @@ func (n *Node) addTrustedPeerAddrs(trusted model.TrustedPeer) {
 	n.host.Peerstore().AddAddrs(id, addrs, peerstore.PermanentAddrTTL)
 }
 
-func (n *Node) currentActive() *activeSwarm {
+func (n *Node) currentSwarm(swarmID string) *activeSwarm {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	return n.active
+	return n.active[swarmID]
 }
 
 func (n *Node) emit(event Event) {
@@ -1059,6 +1106,39 @@ func mergeTrustedPeer(peers []model.TrustedPeer, peerInfo model.TrustedPeer) []m
 		return peers
 	}
 	return append(peers, peerInfo)
+}
+
+func sameSwarmSession(left, right model.Swarm) bool {
+	if left.ID != right.ID || left.Name != right.Name || left.RoomKey != right.RoomKey {
+		return false
+	}
+	if len(left.TrustedPeers) != len(right.TrustedPeers) {
+		return false
+	}
+	for i := range left.TrustedPeers {
+		l := left.TrustedPeers[i]
+		r := right.TrustedPeers[i]
+		if l.PeerID != r.PeerID ||
+			l.Name != r.Name ||
+			l.Fingerprint != r.Fingerprint ||
+			!l.LastSeen.Equal(r.LastSeen) ||
+			!sameStrings(l.Addrs, r.Addrs) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func multiaddrStrings(addrs []ma.Multiaddr) []string {

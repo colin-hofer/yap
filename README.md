@@ -65,6 +65,7 @@ Once installed, `yap update` downloads the latest GitHub release for your curren
 - No central server or relay in v1
 - Stable device identity with saved trust
 - Shared room chat that tolerates peers joining, leaving, and reconnecting
+- Background swarm connections so saved swarms can continue receiving messages while you view another swarm or return home
 - A full-screen terminal UI that is usable without memorizing commands
 
 ## Architecture
@@ -106,13 +107,17 @@ yap version
 - `n`: create a new swarm
 - `i`: generate an invite for the selected swarm
 - `j`: join a selected nearby peer with an invite code
+- `d`: remove the selected swarm locally
 - `u`: quit the TUI and install the latest GitHub release for the current OS/arch
 - `q`: quit
 
 ## Chat Controls
 
-- `ctrl+s`: send the current composer contents
-- `enter`: insert a newline
+- `enter`: send the current composer contents
+- `shift+enter`: insert a newline
+- `tab`: switch focus between the transcript and composer
+- `y`: copy the focused transcript entry
+- `d`: remove the current swarm locally
 - `esc`: leave the current chat and return to the home screen
 - `ctrl+c`: quit
 
@@ -124,7 +129,7 @@ Files:
 
 - `identity.json`: device identity and display name
 - `swarms/<id>.json`: room metadata and trusted peers
-- `transcripts/<id>.jsonl`: local-only transcript, compacted to the most recent 1000 events
+- `transcripts/<id>.jsonl`: retained transcript, compacted to the most recent 1000 events and reconciled with trusted peers when they are online
 
 All app-managed files are written with private permissions.
 

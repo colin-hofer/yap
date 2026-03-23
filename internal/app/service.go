@@ -45,14 +45,23 @@ type Event struct {
 	Approval *p2p.Approval
 }
 
+// SwarmSummary is the UI-facing view of a saved swarm.
+type SwarmSummary struct {
+	Swarm        model.Swarm
+	Connected    bool
+	Unread       int
+	LastActivity time.Time
+}
+
 // State is a snapshot of UI-visible application state.
 type State struct {
-	Identity    model.Identity
-	Swarms      []model.Swarm
-	Nearby      []model.NearbyPeer
-	ActiveSwarm *model.Swarm
-	Transcript  []model.TranscriptEntry
-	Presence    []model.Presence
+	Version       uint64
+	Identity      model.Identity
+	Swarms        []SwarmSummary
+	Nearby        []model.NearbyPeer
+	SelectedSwarm *model.Swarm
+	Transcript    []model.TranscriptEntry
+	Presence      []model.Presence
 }
 
 // Service owns persistence and the node lifecycle.
@@ -63,13 +72,17 @@ type Service struct {
 	store *store.Store
 	node  *p2p.Node
 
-	mu         sync.RWMutex
-	identity   model.Identity
-	swarms     []model.Swarm
-	nearby     map[string]model.NearbyPeer
-	active     *model.Swarm
-	transcript []model.TranscriptEntry
-	presence   []model.Presence
+	mu           sync.RWMutex
+	identity     model.Identity
+	swarms       []model.Swarm
+	nearby       map[string]model.NearbyPeer
+	selectedID   string
+	transcripts  map[string][]model.TranscriptEntry
+	presence     map[string][]model.Presence
+	unread       map[string]int
+	connected    map[string]bool
+	lastActivity map[string]time.Time
+	version      uint64
 
 	events chan Event
 
@@ -98,7 +111,7 @@ func New(parent context.Context, opts Options) (*Service, error) {
 		return nil, err
 	}
 
-	node, err := p2p.New(ctx, identity)
+	node, err := p2p.New(ctx, identity, st)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -119,10 +132,26 @@ func New(parent context.Context, opts Options) (*Service, error) {
 		identity:      identity,
 		swarms:        swarms,
 		nearby:        make(map[string]model.NearbyPeer),
+		transcripts:   make(map[string][]model.TranscriptEntry),
+		presence:      make(map[string][]model.Presence),
+		unread:        make(map[string]int),
+		connected:     make(map[string]bool),
+		lastActivity:  make(map[string]time.Time),
 		events:        make(chan Event, 256),
 		startupOpen:   strings.TrimSpace(opts.OpenSwarm),
 		startupJoin:   yapcrypto.NormalizeInviteCode(opts.JoinCode),
 		autoJoinTried: make(map[string]struct{}),
+	}
+
+	for _, swarm := range swarms {
+		transcript, err := st.LoadTranscript(swarm.ID)
+		if err != nil {
+			node.Close()
+			cancel()
+			return nil, err
+		}
+		svc.transcripts[swarm.ID] = transcript
+		svc.lastActivity[swarm.ID] = activityTime(swarm, transcript)
 	}
 
 	for _, peerInfo := range node.NearbySnapshot() {
@@ -130,6 +159,16 @@ func New(parent context.Context, opts Options) (*Service, error) {
 	}
 
 	go svc.consumeNodeEvents()
+
+	for _, swarm := range swarms {
+		if err := svc.node.OpenSwarm(swarm); err != nil {
+			svc.emitToast(fmt.Sprintf("failed to connect %s: %v", swarm.Name, err))
+			continue
+		}
+		svc.mu.Lock()
+		svc.connected[swarm.ID] = true
+		svc.mu.Unlock()
+	}
 
 	if svc.startupOpen != "" {
 		if err := svc.OpenSwarm(svc.startupOpen); err != nil {
@@ -151,6 +190,13 @@ func (s *Service) Events() <-chan Event {
 func (s *Service) Snapshot() State {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.snapshotLocked()
+}
+
+func (s *Service) nextSnapshot() State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.version++
 	return s.snapshotLocked()
 }
 
@@ -180,6 +226,8 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 		return model.Swarm{}, err
 	}
 	s.mu.Lock()
+	s.transcripts[swarm.ID] = nil
+	s.lastActivity[swarm.ID] = swarm.LastOpened
 	if err := s.reloadSwarmsLocked(); err != nil {
 		s.mu.Unlock()
 		return model.Swarm{}, err
@@ -189,13 +237,9 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 	return swarm, nil
 }
 
-// OpenSwarm loads and joins the selected swarm.
+// OpenSwarm selects a swarm and ensures it is connected in the background.
 func (s *Service) OpenSwarm(ref string) error {
 	swarm, err := s.findSwarm(ref)
-	if err != nil {
-		return err
-	}
-	transcript, err := s.store.LoadTranscript(swarm.ID)
 	if err != nil {
 		return err
 	}
@@ -207,10 +251,19 @@ func (s *Service) OpenSwarm(ref string) error {
 	if err := s.node.OpenSwarm(swarm); err != nil {
 		return err
 	}
+
 	s.mu.Lock()
-	s.active = &swarm
-	s.transcript = transcript
-	s.presence = nil
+	s.selectedID = swarm.ID
+	s.connected[swarm.ID] = true
+	s.unread[swarm.ID] = 0
+	if _, ok := s.transcripts[swarm.ID]; !ok {
+		transcript, err := s.store.LoadTranscript(swarm.ID)
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		s.transcripts[swarm.ID] = transcript
+	}
 	if err := s.reloadSwarmsLocked(); err != nil {
 		s.mu.Unlock()
 		return err
@@ -220,15 +273,44 @@ func (s *Service) OpenSwarm(ref string) error {
 	return nil
 }
 
-// LeaveSwarm leaves the current room and returns to the home state.
+// LeaveSwarm clears the current selection and returns to the home state.
 func (s *Service) LeaveSwarm() error {
-	if err := s.node.CloseSwarm(); err != nil {
+	s.mu.Lock()
+	s.selectedID = ""
+	s.mu.Unlock()
+	s.emitSync()
+	return nil
+}
+
+// RemoveSwarm forgets a saved swarm locally and deletes its transcript.
+func (s *Service) RemoveSwarm(ref string) error {
+	swarm, err := s.findSwarm(ref)
+	if err != nil {
 		return err
 	}
+	if err := s.node.CloseSwarm(swarm.ID); err != nil {
+		return err
+	}
+	if err := s.store.DeleteTranscript(swarm.ID); err != nil {
+		return err
+	}
+	if err := s.store.DeleteSwarm(swarm.ID); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
-	s.active = nil
-	s.transcript = nil
-	s.presence = nil
+	delete(s.transcripts, swarm.ID)
+	delete(s.presence, swarm.ID)
+	delete(s.unread, swarm.ID)
+	delete(s.connected, swarm.ID)
+	delete(s.lastActivity, swarm.ID)
+	if s.selectedID == swarm.ID {
+		s.selectedID = ""
+	}
+	if err := s.reloadSwarmsLocked(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.mu.Unlock()
 	s.emitSync()
 	return nil
@@ -245,7 +327,7 @@ func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
 		return model.Invite{}, err
 	}
 	select {
-	case s.events <- Event{Type: EventInvite, Invite: &invite, Snapshot: s.Snapshot()}:
+	case s.events <- Event{Type: EventInvite, Invite: &invite, Snapshot: s.nextSnapshot()}:
 	case <-s.ctx.Done():
 	}
 	return invite, nil
@@ -261,9 +343,15 @@ func (s *Service) ResolveApproval(id string, accept bool) error {
 	return s.node.ResolveApproval(id, accept)
 }
 
-// SendChat publishes a chat message to the active swarm.
+// SendChat publishes a chat message to the selected swarm.
 func (s *Service) SendChat(body string) error {
-	return s.node.PublishChat(body)
+	s.mu.RLock()
+	selectedID := s.selectedID
+	s.mu.RUnlock()
+	if strings.TrimSpace(selectedID) == "" {
+		return fmt.Errorf("no swarm selected")
+	}
+	return s.node.PublishChat(selectedID, body)
 }
 
 // Shutdown stops background work and closes the node.
@@ -303,7 +391,7 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		case s.events <- Event{
 			Type:     EventApproval,
 			Approval: event.Approval,
-			Snapshot: s.Snapshot(),
+			Snapshot: s.nextSnapshot(),
 		}:
 		case <-s.ctx.Done():
 		}
@@ -313,46 +401,99 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		}
 		s.handlePairComplete(*event.Pair, event.AutoOpen)
 	case p2p.EventTranscript:
-		if event.Entry == nil {
-			return
+		if event.Entry != nil {
+			s.handleTranscriptEvent(*event.Entry, true)
 		}
-		s.mu.Lock()
-		if s.active != nil && s.active.ID == event.Entry.SwarmID {
-			s.transcript = append(s.transcript, *event.Entry)
-			if len(s.transcript) > 1000 {
-				s.transcript = s.transcript[len(s.transcript)-1000:]
-			}
-		}
-		s.mu.Unlock()
-		_ = s.store.AppendTranscript(event.Entry.SwarmID, *event.Entry)
-		s.emitSync()
+	case p2p.EventHistory:
+		s.handleHistoryImport(event.SwarmID, event.Entries)
 	case p2p.EventPresence:
-		s.mu.Lock()
-		s.presence = append([]model.Presence(nil), event.Presence...)
-		if s.active != nil {
-			active := *s.active
-			updated := false
-			for _, presence := range event.Presence {
-				if presence.PeerID == "" {
-					continue
-				}
-				peerInfo := model.TrustedPeer{
-					PeerID:      presence.PeerID,
-					Name:        presence.Name,
-					Fingerprint: presence.Fingerprint,
-					LastSeen:    presence.LastSeen,
-				}
-				active.TrustedPeers = mergeTrustedPeer(active.TrustedPeers, peerInfo)
-				updated = true
-			}
-			if updated {
-				s.active = &active
-				_ = s.store.SaveSwarm(active)
-			}
+		s.handlePresenceEvent(event.SwarmID, event.Presence)
+	}
+}
+
+func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist bool) {
+	s.mu.Lock()
+	merged, added := mergeTranscriptEntries(s.transcripts[entry.SwarmID], []model.TranscriptEntry{entry})
+	s.transcripts[entry.SwarmID] = merged
+	if len(added) > 0 {
+		s.lastActivity[entry.SwarmID] = activityTimeForEntries(s.lastActivity[entry.SwarmID], added)
+	}
+	selected := s.selectedID == entry.SwarmID
+	swarmName := s.swarmNameLocked(entry.SwarmID)
+	if !selected && len(added) > 0 && entry.Kind == "chat" {
+		s.unread[entry.SwarmID] += len(added)
+	}
+	s.mu.Unlock()
+
+	if persist {
+		if err := s.store.AppendTranscript(entry.SwarmID, entry); err != nil {
+			s.emitToast(err.Error())
 		}
+	}
+	if !selected && entry.Kind == "chat" && swarmName != "" {
+		s.emitToast(fmt.Sprintf("new message in %s from %s", swarmName, entry.SenderName))
+		return
+	}
+	s.emitSync()
+}
+
+func (s *Service) handleHistoryImport(swarmID string, entries []model.TranscriptEntry) {
+	if strings.TrimSpace(swarmID) == "" || len(entries) == 0 {
+		return
+	}
+	s.mu.Lock()
+	merged, added := mergeTranscriptEntries(s.transcripts[swarmID], entries)
+	if len(added) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.transcripts[swarmID] = merged
+	s.lastActivity[swarmID] = activityTimeForEntries(s.lastActivity[swarmID], added)
+	if s.selectedID != swarmID {
+		s.unread[swarmID] += countChatEntries(added)
+	}
+	s.mu.Unlock()
+	s.emitSync()
+}
+
+func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence) {
+	if strings.TrimSpace(swarmID) == "" {
+		return
+	}
+	s.mu.Lock()
+	s.presence[swarmID] = append([]model.Presence(nil), presence...)
+	swarm, ok := s.findSwarmLocked(swarmID)
+	if !ok {
 		s.mu.Unlock()
 		s.emitSync()
+		return
 	}
+	updated := false
+	for _, item := range presence {
+		if item.PeerID == "" {
+			continue
+		}
+		peerInfo := model.TrustedPeer{
+			PeerID:      item.PeerID,
+			Name:        item.Name,
+			Fingerprint: item.Fingerprint,
+			LastSeen:    item.LastSeen,
+		}
+		next := mergeTrustedPeer(swarm.TrustedPeers, peerInfo)
+		if !trustedPeersEqual(swarm.TrustedPeers, next) {
+			swarm.TrustedPeers = next
+			updated = true
+		}
+	}
+	if updated {
+		s.replaceSwarmLocked(swarm)
+	}
+	s.mu.Unlock()
+
+	if updated {
+		_ = s.store.SaveSwarm(swarm)
+	}
+	s.emitSync()
 }
 
 func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
@@ -368,11 +509,12 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 			s.emitToast(err.Error())
 			return
 		}
-		s.mu.Lock()
-		if s.active != nil && s.active.ID == swarm.ID {
-			s.active = &swarm
+		if err := s.node.OpenSwarm(swarm); err != nil {
+			s.emitToast(err.Error())
 		}
-		_ = s.reloadSwarmsLocked()
+		s.mu.Lock()
+		s.connected[swarm.ID] = true
+		s.replaceSwarmLocked(swarm)
 		s.mu.Unlock()
 		s.emitToast(fmt.Sprintf("%s joined %s", displayName(result.Peer), swarm.Name))
 		s.emitSync()
@@ -385,9 +527,19 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 			s.emitToast(err.Error())
 			return
 		}
+		if err := s.node.OpenSwarm(swarm); err != nil {
+			s.emitToast(err.Error())
+		}
+
 		s.mu.Lock()
+		if _, ok := s.transcripts[swarm.ID]; !ok {
+			s.transcripts[swarm.ID] = nil
+		}
+		s.lastActivity[swarm.ID] = swarm.LastOpened
+		s.connected[swarm.ID] = true
 		_ = s.reloadSwarmsLocked()
 		s.mu.Unlock()
+
 		s.emitToast(fmt.Sprintf("paired with %s and saved %s", displayName(result.Peer), swarm.Name))
 		if autoOpen || s.startupJoin != "" {
 			s.startupJoin = ""
@@ -421,7 +573,7 @@ func (s *Service) maybeAutoJoin(peerID string) {
 
 func (s *Service) emitSync() {
 	select {
-	case s.events <- Event{Type: EventSync, Snapshot: s.Snapshot()}:
+	case s.events <- Event{Type: EventSync, Snapshot: s.nextSnapshot()}:
 	case <-s.ctx.Done():
 	}
 }
@@ -431,7 +583,7 @@ func (s *Service) emitToast(message string) {
 		return
 	}
 	select {
-	case s.events <- Event{Type: EventToast, Message: message, Snapshot: s.Snapshot()}:
+	case s.events <- Event{Type: EventToast, Message: message, Snapshot: s.nextSnapshot()}:
 	case <-s.ctx.Done():
 	}
 }
@@ -448,23 +600,39 @@ func (s *Service) snapshotLocked() State {
 		return nearby[i].LastSeen.After(nearby[j].LastSeen)
 	})
 
-	swarms := append([]model.Swarm(nil), s.swarms...)
-	transcript := append([]model.TranscriptEntry(nil), s.transcript...)
-	presence := append([]model.Presence(nil), s.presence...)
-
-	var active *model.Swarm
-	if s.active != nil {
-		copy := *s.active
-		active = &copy
+	swarms := make([]SwarmSummary, 0, len(s.swarms))
+	for _, swarm := range s.swarms {
+		lastActivity := s.lastActivity[swarm.ID]
+		if lastActivity.IsZero() {
+			lastActivity = swarm.LastOpened
+		}
+		swarms = append(swarms, SwarmSummary{
+			Swarm:        swarm,
+			Connected:    s.connected[swarm.ID],
+			Unread:       s.unread[swarm.ID],
+			LastActivity: lastActivity,
+		})
 	}
 
+	var selected *model.Swarm
+	if strings.TrimSpace(s.selectedID) != "" {
+		if swarm, ok := s.findSwarmLocked(s.selectedID); ok {
+			copy := swarm
+			selected = &copy
+		}
+	}
+
+	transcript := append([]model.TranscriptEntry(nil), s.transcripts[s.selectedID]...)
+	presence := append([]model.Presence(nil), s.presence[s.selectedID]...)
+
 	return State{
-		Identity:    s.identity,
-		Swarms:      swarms,
-		Nearby:      nearby,
-		ActiveSwarm: active,
-		Transcript:  transcript,
-		Presence:    presence,
+		Version:       s.version,
+		Identity:      s.identity,
+		Swarms:        swarms,
+		Nearby:        nearby,
+		SelectedSwarm: selected,
+		Transcript:    transcript,
+		Presence:      presence,
 	}
 }
 
@@ -484,17 +652,48 @@ func (s *Service) findSwarm(ref string) (model.Swarm, error) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	swarm, ok := s.findSwarmLocked(ref)
+	if !ok {
+		return model.Swarm{}, fmt.Errorf("swarm %q not found", ref)
+	}
+	return swarm, nil
+}
+
+func (s *Service) findSwarmLocked(ref string) (model.Swarm, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return model.Swarm{}, false
+	}
 	for _, swarm := range s.swarms {
 		if swarm.ID == ref || strings.EqualFold(swarm.Name, ref) {
-			return swarm, nil
+			return swarm, true
 		}
 	}
 	for _, swarm := range s.swarms {
 		if strings.HasPrefix(strings.ToLower(swarm.ID), strings.ToLower(ref)) {
-			return swarm, nil
+			return swarm, true
 		}
 	}
-	return model.Swarm{}, fmt.Errorf("swarm %q not found", ref)
+	return model.Swarm{}, false
+}
+
+func (s *Service) replaceSwarmLocked(updated model.Swarm) {
+	for i, swarm := range s.swarms {
+		if swarm.ID == updated.ID {
+			s.swarms[i] = updated
+			return
+		}
+	}
+	s.swarms = append(s.swarms, updated)
+}
+
+func (s *Service) swarmNameLocked(id string) string {
+	for _, swarm := range s.swarms {
+		if swarm.ID == id {
+			return swarm.Name
+		}
+	}
+	return ""
 }
 
 func loadOrCreateIdentity(st *store.Store) (model.Identity, error) {
@@ -601,4 +800,109 @@ func displayNearbyName(peerInfo model.NearbyPeer) string {
 		return peerInfo.Name
 	}
 	return peerInfo.PeerID
+}
+
+func activityTime(swarm model.Swarm, transcript []model.TranscriptEntry) time.Time {
+	last := swarm.LastOpened
+	for _, entry := range transcript {
+		if entry.SentAt.After(last) {
+			last = entry.SentAt
+		}
+	}
+	return last
+}
+
+func activityTimeForEntries(current time.Time, entries []model.TranscriptEntry) time.Time {
+	last := current
+	for _, entry := range entries {
+		if entry.SentAt.After(last) {
+			last = entry.SentAt
+		}
+	}
+	return last
+}
+
+func mergeTranscriptEntries(existing, incoming []model.TranscriptEntry) ([]model.TranscriptEntry, []model.TranscriptEntry) {
+	known := make(map[string]struct{}, len(existing))
+	merged := append([]model.TranscriptEntry(nil), existing...)
+	for _, entry := range existing {
+		known[entry.ID] = struct{}{}
+	}
+
+	added := make([]model.TranscriptEntry, 0, len(incoming))
+	for _, entry := range incoming {
+		if strings.TrimSpace(entry.ID) == "" {
+			continue
+		}
+		if _, ok := known[entry.ID]; ok {
+			continue
+		}
+		known[entry.ID] = struct{}{}
+		merged = append(merged, entry)
+		added = append(added, entry)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].SentAt.Equal(merged[j].SentAt) {
+			return merged[i].ID < merged[j].ID
+		}
+		return merged[i].SentAt.Before(merged[j].SentAt)
+	})
+	if len(merged) > 1000 {
+		merged = merged[len(merged)-1000:]
+	}
+	retained := make(map[string]struct{}, len(merged))
+	for _, entry := range merged {
+		retained[entry.ID] = struct{}{}
+	}
+	filtered := make([]model.TranscriptEntry, 0, len(added))
+	for _, entry := range added {
+		if _, ok := retained[entry.ID]; ok {
+			filtered = append(filtered, entry)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].SentAt.Equal(filtered[j].SentAt) {
+			return filtered[i].ID < filtered[j].ID
+		}
+		return filtered[i].SentAt.Before(filtered[j].SentAt)
+	})
+	return merged, filtered
+}
+
+func countChatEntries(entries []model.TranscriptEntry) int {
+	count := 0
+	for _, entry := range entries {
+		if entry.Kind == "chat" {
+			count++
+		}
+	}
+	return count
+}
+
+func trustedPeersEqual(left, right []model.TrustedPeer) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].PeerID != right[i].PeerID ||
+			left[i].Name != right[i].Name ||
+			left[i].Fingerprint != right[i].Fingerprint ||
+			!left[i].LastSeen.Equal(right[i].LastSeen) ||
+			!stringSlicesEqual(left[i].Addrs, right[i].Addrs) {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }

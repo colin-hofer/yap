@@ -158,44 +158,77 @@ func (s *Store) LoadTranscript(swarmID string) ([]model.TranscriptEntry, error) 
 
 // AppendTranscript appends an entry and compacts the file to the most recent limit.
 func (s *Store) AppendTranscript(swarmID string, entry model.TranscriptEntry) error {
-	entries, err := s.LoadTranscript(swarmID)
+	_, err := s.MergeTranscript(swarmID, []model.TranscriptEntry{entry})
+	return err
+}
+
+// MergeTranscript merges transcript entries by ID, keeps them in chronological
+// order, and returns the entries that were newly added and retained.
+func (s *Store) MergeTranscript(swarmID string, incoming []model.TranscriptEntry) ([]model.TranscriptEntry, error) {
+	if len(incoming) == 0 {
+		return nil, nil
+	}
+	existing, err := s.LoadTranscript(swarmID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	entries = append(entries, entry)
-	if len(entries) > transcriptLimit {
-		entries = entries[len(entries)-transcriptLimit:]
+
+	known := make(map[string]struct{}, len(existing))
+	for _, entry := range existing {
+		known[entry.ID] = struct{}{}
 	}
-	path := s.transcriptPath(swarmID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create transcript dir: %w", err)
-	}
-	tmp := path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open transcript temp file: %w", err)
-	}
-	writer := bufio.NewWriter(file)
-	for _, item := range entries {
-		data, err := json.Marshal(item)
-		if err != nil {
-			file.Close()
-			return fmt.Errorf("encode transcript entry: %w", err)
+
+	merged := append([]model.TranscriptEntry(nil), existing...)
+	candidates := make([]model.TranscriptEntry, 0, len(incoming))
+	for _, entry := range incoming {
+		if strings.TrimSpace(entry.ID) == "" {
+			continue
 		}
-		if _, err := writer.Write(append(data, '\n')); err != nil {
-			file.Close()
-			return fmt.Errorf("write transcript entry: %w", err)
+		if _, ok := known[entry.ID]; ok {
+			continue
+		}
+		known[entry.ID] = struct{}{}
+		merged = append(merged, entry)
+		candidates = append(candidates, entry)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	sortTranscript(merged)
+	if len(merged) > transcriptLimit {
+		merged = merged[len(merged)-transcriptLimit:]
+	}
+	if err := s.writeTranscript(s.transcriptPath(swarmID), merged); err != nil {
+		return nil, err
+	}
+
+	retained := make(map[string]struct{}, len(merged))
+	for _, entry := range merged {
+		retained[entry.ID] = struct{}{}
+	}
+	added := make([]model.TranscriptEntry, 0, len(candidates))
+	for _, entry := range candidates {
+		if _, ok := retained[entry.ID]; ok {
+			added = append(added, entry)
 		}
 	}
-	if err := writer.Flush(); err != nil {
-		file.Close()
-		return fmt.Errorf("flush transcript: %w", err)
+	sortTranscript(added)
+	return added, nil
+}
+
+// DeleteSwarm removes a persisted swarm profile.
+func (s *Store) DeleteSwarm(id string) error {
+	if err := os.Remove(s.swarmPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete swarm: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close transcript: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("persist transcript: %w", err)
+	return nil
+}
+
+// DeleteTranscript removes a persisted transcript file.
+func (s *Store) DeleteTranscript(id string) error {
+	if err := os.Remove(s.transcriptPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete transcript: %w", err)
 	}
 	return nil
 }
@@ -236,4 +269,47 @@ func (s *Store) writeJSON(path string, value any) error {
 		return fmt.Errorf("persist file: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) writeTranscript(path string, entries []model.TranscriptEntry) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create transcript dir: %w", err)
+	}
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open transcript temp file: %w", err)
+	}
+	writer := bufio.NewWriter(file)
+	for _, item := range entries {
+		data, err := json.Marshal(item)
+		if err != nil {
+			file.Close()
+			return fmt.Errorf("encode transcript entry: %w", err)
+		}
+		if _, err := writer.Write(append(data, '\n')); err != nil {
+			file.Close()
+			return fmt.Errorf("write transcript entry: %w", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		file.Close()
+		return fmt.Errorf("flush transcript: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close transcript: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("persist transcript: %w", err)
+	}
+	return nil
+}
+
+func sortTranscript(entries []model.TranscriptEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].SentAt.Equal(entries[j].SentAt) {
+			return entries[i].ID < entries[j].ID
+		}
+		return entries[i].SentAt.Before(entries[j].SentAt)
+	})
 }

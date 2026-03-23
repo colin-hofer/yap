@@ -48,10 +48,11 @@ This keeps the UI responsive even when peers disappear abruptly.
 
 ## UI Shape
 
-The interface is intentionally split into two modes:
+The interface keeps the same home/chat views, but saved swarms stay connected in
+the background while the app is running:
 
-- Home: saved swarms, nearby peers, pending invites, and pairing prompts
-- Chat: timeline viewport, peer sidebar, status line, and multiline composer
+- Home: saved swarms, nearby peers, unread activity, pending invites, and pairing prompts
+- Chat: selected swarm timeline, peer sidebar, status line, and multiline composer
 
 The UI only talks to the `internal/app` service. It never mutates persistence or libp2p state directly.
 
@@ -59,6 +60,6 @@ The UI only talks to the `internal/app` service. It never mutates persistence or
 
 - identity is global to the device
 - swarms are saved independently and can be reopened later
-- transcripts are local-only and not synchronized
+- transcripts are retained locally and reconciled with trusted peers when they are online
 - metadata writes are atomic
 - transcript compaction keeps the last 1000 events
