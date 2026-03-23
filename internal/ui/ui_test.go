@@ -8,7 +8,6 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
-	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
 	"yap/internal/app"
@@ -42,24 +41,6 @@ func TestHandleChatDoesNotTreatDAsCommandWhileComposerFocused(t *testing.T) {
 	}
 	if got.composer.Value() != "d" {
 		t.Fatalf("composer.Value() = %q, want %q", got.composer.Value(), "d")
-	}
-}
-
-func TestHandleChatDoesNotTreatDAsCommandWhileTranscriptFocused(t *testing.T) {
-	composer := newTestComposer()
-
-	m := &modelUI{
-		mode:     "chat",
-		focus:    "transcript",
-		state:    app.State{SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
-		composer: composer,
-	}
-
-	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'd', Text: "d"})
-	got := modelOut.(*modelUI)
-
-	if got.modal.Kind != "" {
-		t.Fatalf("modal.Kind = %q, want empty", got.modal.Kind)
 	}
 }
 
@@ -162,35 +143,7 @@ func TestHandleChatTabCompletesMentionBeforeChangingFocus(t *testing.T) {
 	}
 }
 
-func TestHandleChatReplyShortcutSelectsMessage(t *testing.T) {
-	composer := newTestComposer()
-
-	m := &modelUI{
-		mode:          "chat",
-		focus:         "transcript",
-		transcriptIdx: 0,
-		state: app.State{
-			Identity:      model.Identity{Name: "me", PeerID: "self"},
-			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
-			Transcript: []model.TranscriptEntry{
-				{ID: "msg-1", Kind: "chat", SenderName: "Peer", Body: "hello"},
-			},
-		},
-		composer: composer,
-	}
-
-	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'r', Text: "r"})
-	got := modelOut.(*modelUI)
-
-	if got.focus != "composer" {
-		t.Fatalf("focus = %q, want composer", got.focus)
-	}
-	if got.replyTo == nil || got.replyTo.ID != "msg-1" {
-		t.Fatalf("replyTo = %#v, want msg-1", got.replyTo)
-	}
-}
-
-func TestRenderTranscriptShowsUnreadSeparatorAndReplyQuote(t *testing.T) {
+func TestRenderTranscriptShowsUnreadSeparator(t *testing.T) {
 	m := &modelUI{
 		state: app.State{
 			Identity:      model.Identity{Name: "me", PeerID: "self"},
@@ -200,14 +153,11 @@ func TestRenderTranscriptShowsUnreadSeparatorAndReplyQuote(t *testing.T) {
 
 	content := m.renderTranscript([]model.TranscriptEntry{
 		{ID: "msg-1", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "hello there", SentAt: time.Unix(10, 0)},
-		{ID: "msg-2", Kind: "chat", SenderPeerID: "peer-2", SenderName: "Other", Body: "replying", ReplyTo: "msg-1", SentAt: time.Unix(20, 0)},
+		{ID: "msg-2", Kind: "chat", SenderPeerID: "peer-2", SenderName: "Other", Body: "replying", SentAt: time.Unix(20, 0)},
 	}, 80)
 
 	if !strings.Contains(content, "── new messages ──") {
 		t.Fatalf("renderTranscript() missing unread separator:\n%s", content)
-	}
-	if !strings.Contains(content, "↪ Peer: hello there") {
-		t.Fatalf("renderTranscript() missing reply quote:\n%s", content)
 	}
 }
 
@@ -227,37 +177,6 @@ func TestConnectionSummaryReflectsPeerHealth(t *testing.T) {
 
 	if got := m.connectionSummary(); got != "◉ 2 online · 1 stale" {
 		t.Fatalf("connectionSummary() = %q", got)
-	}
-}
-
-func TestSyncTranscriptKeepsSelectedMessageVisible(t *testing.T) {
-	m := &modelUI{
-		mode:     "chat",
-		focus:    "composer",
-		state:    app.State{Identity: model.Identity{Name: "me", PeerID: "self"}, SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
-		messages: viewport.New(),
-	}
-	m.messages.SoftWrap = true
-	m.messages.SetWidth(20)
-	m.messages.SetHeight(3)
-	for i := 0; i < 8; i++ {
-		m.state.Transcript = append(m.state.Transcript, model.TranscriptEntry{
-			ID:           string(rune('a' + i)),
-			Kind:         "chat",
-			SenderPeerID: "peer-1",
-			SenderName:   "Peer",
-			Body:         "message body",
-			SentAt:       time.Unix(int64(i), 0),
-		})
-	}
-
-	m.syncTranscript(true)
-	m.focus = "transcript"
-	m.transcriptIdx = 0
-	m.syncTranscript(false)
-
-	if got := m.messages.YOffset(); got != 0 {
-		t.Fatalf("messages.YOffset() = %d, want 0", got)
 	}
 }
 

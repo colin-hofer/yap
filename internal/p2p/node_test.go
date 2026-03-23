@@ -48,7 +48,7 @@ func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 		SentAt:     sentAt,
 	}
 
-	entry := transcriptEntryFromEnvelope("swarm-1", "peer-1", env, "hello", " msg-0 ", true)
+	entry := transcriptEntryFromEnvelope("swarm-1", "peer-1", env, "hello", true)
 
 	if entry.ID != env.ID {
 		t.Fatalf("entry.ID = %q, want %q", entry.ID, env.ID)
@@ -58,9 +58,6 @@ func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 	}
 	if !entry.Local {
 		t.Fatal("entry.Local = false, want true")
-	}
-	if got, want := entry.ReplyTo, "msg-0"; got != want {
-		t.Fatalf("entry.ReplyTo = %q, want %q", got, want)
 	}
 }
 

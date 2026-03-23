@@ -78,14 +78,11 @@ type modelUI struct {
 	width  int
 	height int
 
-	mode          string
-	focus         string
-	swarmIdx      int
-	nearbyIdx     int
-	transcriptIdx int
-	transcriptSel transcriptSelection
-	status        string
-	replyTo       *model.TranscriptEntry
+	mode      string
+	focus     string
+	swarmIdx  int
+	nearbyIdx int
+	status    string
 
 	updateRequested   bool
 	checkingUpdate    bool
@@ -116,15 +113,8 @@ type copyResultMsg struct {
 	Message string
 }
 
-type transcriptSelection struct {
-	StartLine int
-	EndLine   int
-}
-
 type transcriptRender struct {
-	Lines         []string
-	SelectedStart int
-	SelectedEnd   int
+	Lines []string
 }
 
 func newModel(service *app.Service) *modelUI {
@@ -175,7 +165,6 @@ func newModel(service *app.Service) *modelUI {
 		composer: composer,
 		prompt:   prompt,
 	}
-	model.messages.LeftGutterFunc = model.transcriptGutter
 	return model
 }
 
@@ -270,7 +259,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.prompt, cmd = m.prompt.Update(msg)
 		return m, cmd
 	}
-	if m.mode == "chat" && m.focus != "transcript" {
+	if m.mode == "chat" {
 		var cmd tea.Cmd
 		m.composer, cmd = m.composer.Update(msg)
 		return m, cmd
@@ -410,13 +399,6 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
-	case "ctrl+r":
-		if m.replyTo != nil {
-			m.replyTo = nil
-			m.updateComposerPlaceholder()
-			m.status = "reply canceled"
-			return m, nil
-		}
 	case "esc":
 		m.notifyTyping(false)
 		if err := m.service.LeaveSwarm(); err != nil {
@@ -427,49 +409,10 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.composer.Blur()
 		return m, nil
 	case "tab":
-		if m.focus == "composer" {
-			if m.applyMentionCompletion() {
-				m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
-				return m, nil
-			}
-			if len(m.state.Transcript) > 0 {
-				m.transcriptIdx = len(m.state.Transcript) - 1
-			}
-			m.focus = "transcript"
-			m.composer.Blur()
-			m.syncTranscript(false)
-		} else {
-			m.focus = "composer"
-			m.composer.Focus()
+		if m.applyMentionCompletion() {
+			m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
 		}
 		return m, nil
-	case "r":
-		if m.focus == "transcript" {
-			entry := m.selectedTranscriptEntry()
-			if entry == nil || entry.Kind != "chat" {
-				m.status = "select a chat message to reply"
-				return m, nil
-			}
-			copy := *entry
-			m.replyTo = &copy
-			m.focus = "composer"
-			m.composer.Focus()
-			m.updateComposerPlaceholder()
-			m.status = fmt.Sprintf("replying to %s", entry.SenderName)
-			return m, nil
-		}
-	case "up":
-		if m.focus == "transcript" && m.transcriptIdx > 0 {
-			m.transcriptIdx--
-			m.syncTranscript(false)
-			return m, nil
-		}
-	case "down":
-		if m.focus == "transcript" && m.transcriptIdx < len(m.state.Transcript)-1 {
-			m.transcriptIdx++
-			m.syncTranscript(false)
-			return m, nil
-		}
 	case "pgup", "pageup":
 		m.messages.PageUp()
 		return m, nil
@@ -489,29 +432,18 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.messages.HalfPageDown()
 		return m, nil
 	case "enter":
-		if m.focus == "transcript" {
-			return m, nil
-		}
 		body := strings.TrimSpace(m.composer.Value())
 		if body == "" {
 			return m, nil
 		}
-		replyTo := ""
-		if m.replyTo != nil {
-			replyTo = m.replyTo.ID
-		}
-		if err := m.service.SendChat(body, replyTo); err != nil {
+		if err := m.service.SendChat(body); err != nil {
 			m.status = err.Error()
 			return m, nil
 		}
 		m.composer.SetValue("")
-		m.replyTo = nil
 		m.updateComposerPlaceholder()
 		m.notifyTyping(false)
 		m.syncTranscript(true)
-		return m, nil
-	}
-	if m.focus == "transcript" {
 		return m, nil
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
@@ -667,9 +599,7 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
-			if m.focus != "transcript" {
-				m.focus = "composer"
-			}
+			m.focus = "composer"
 			m.composer.Focus()
 		} else {
 			m.mode = "home"
@@ -678,16 +608,6 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		}
 		m.restoreHighlightedSwarm(prevSwarmID)
 		m.restoreHighlightedNearby(prevNearbyID)
-		if m.transcriptIdx >= len(m.state.Transcript) && len(m.state.Transcript) > 0 {
-			m.transcriptIdx = len(m.state.Transcript) - 1
-		}
-		if len(m.state.Transcript) == 0 {
-			m.transcriptIdx = 0
-		}
-		if selectedSwarmID(prevState) != selectedSwarmID(m.state) {
-			m.replyTo = nil
-			m.updateComposerPlaceholder()
-		}
 		m.syncLayout()
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
 			m.syncTranscript(false)
@@ -701,10 +621,6 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			m.state = event.Snapshot
 		}
 		m.status = event.Message
-		if selectedSwarmID(prevState) != selectedSwarmID(m.state) {
-			m.replyTo = nil
-			m.updateComposerPlaceholder()
-		}
 		m.restoreHighlightedSwarm(prevSwarmID)
 		m.restoreHighlightedNearby(prevNearbyID)
 		m.syncLayout()
@@ -783,14 +699,9 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 		return
 	}
 	rendered := m.renderTranscriptView(m.state.Transcript, width)
-	wasAtBottom := forceBottom || (m.focus != "transcript" && m.messages.AtBottom())
+	wasAtBottom := forceBottom || m.messages.AtBottom()
 	offset := m.messages.YOffset()
 	m.messages.SetContentLines(rendered.Lines)
-	m.transcriptSel = transcriptSelection{StartLine: rendered.SelectedStart, EndLine: rendered.SelectedEnd}
-	if m.focus == "transcript" && rendered.SelectedStart >= 0 {
-		m.messages.EnsureVisible(rendered.SelectedStart, 0, 0)
-		return
-	}
 	if wasAtBottom {
 		m.messages.GotoBottom()
 		return
@@ -937,11 +848,7 @@ func (m *modelUI) renderChat(width, height int) string {
 
 	panelHeight := msgHeight + 4
 
-	mainStyle := focusedPanelStyle
-	if m.focus == "transcript" {
-		mainStyle = focusedPanelStyle
-	}
-	main := mainStyle.Width(mainWidth).Height(panelHeight).Render(
+	main := focusedPanelStyle.Width(mainWidth).Height(panelHeight).Render(
 		m.messages.View() + "\n\n" + m.renderComposerArea(),
 	)
 
@@ -1001,37 +908,26 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 		width = 70
 	}
 	if len(entries) == 0 {
-		return transcriptRender{
-			Lines:         []string{mutedStyle.Render("No messages yet.")},
-			SelectedStart: -1,
-			SelectedEnd:   -1,
-		}
+		return transcriptRender{Lines: []string{mutedStyle.Render("No messages yet.")}}
 	}
 	lines := make([]string, 0, len(entries)*4)
-	quoted := make(map[string]model.TranscriptEntry, len(entries))
-	for _, entry := range entries {
-		quoted[entry.ID] = entry
-	}
 	prevSender := ""
 	prevKind := ""
-	prevReplyTo := ""
 	first := true
 	insertedUnread := false
-	selectedStart := -1
-	selectedEnd := -1
 	lastOpened := time.Time{}
 	if m.state.SelectedSwarm != nil {
 		lastOpened = m.state.SelectedSwarm.LastOpened
 	}
-	for i, entry := range entries {
+	for _, entry := range entries {
 		if entry.Kind != "chat" && entry.Kind != "join" && entry.Kind != "leave" {
 			if strings.TrimSpace(entry.Body) == "" {
 				continue
 			}
 		}
 
-		// Consecutive plain chat messages from the same sender get collapsed.
-		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender && entry.ReplyTo == "" && prevReplyTo == ""
+		// Consecutive chat messages from the same sender get collapsed.
+		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender
 
 		if !first {
 			if sameSender {
@@ -1048,19 +944,7 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 			insertedUnread = true
 		}
 
-		selected := i == m.transcriptIdx && m.focus == "transcript"
-		var block string
-		if selected {
-			block = selectedStyle.Render(renderTranscriptEntrySelected(entry, sameSender, quoted, m.selfMentionHandle()))
-		} else {
-			block = renderTranscriptEntry(entry, sameSender, quoted, m.selfMentionHandle())
-		}
-		blockLines := strings.Split(block, "\n")
-		if selected {
-			selectedStart = len(lines)
-			selectedEnd = len(lines) + len(blockLines) - 1
-		}
-		lines = append(lines, blockLines...)
+		lines = append(lines, strings.Split(renderTranscriptEntry(entry, sameSender, m.selfMentionHandle()), "\n")...)
 
 		if entry.Kind == "chat" {
 			prevSender = entry.SenderPeerID
@@ -1068,14 +952,9 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 			prevSender = ""
 		}
 		prevKind = entry.Kind
-		prevReplyTo = entry.ReplyTo
 		first = false
 	}
-	return transcriptRender{
-		Lines:         lines,
-		SelectedStart: selectedStart,
-		SelectedEnd:   selectedEnd,
-	}
+	return transcriptRender{Lines: lines}
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1023,7 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 	return &peerInfo
 }
 
-func renderChatEntry(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
+func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle string) string {
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
@@ -1155,26 +1034,19 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, quoted map[
 	if selfHandle != "" && !entry.Local && mentionsHandle(entry.Body, selfHandle) {
 		mentionBadge = accentStyle.Render(" @you")
 	}
-	quote := renderReplyQuote(entry, quoted)
 	if continuation {
-		if quote != "" {
-			return quote + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
-		}
 		return renderChatBody(entry.Body, bodyStyle, selfHandle)
 	}
 	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
 	sep := mutedStyle.Render(" · ")
 	header := ts + sep + nameStyle.Render(entry.SenderName) + mentionBadge
-	if quote != "" {
-		return header + "\n" + quote + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
-	}
 	return header + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
 }
 
-func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
+func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, selfHandle string) string {
 	switch entry.Kind {
 	case "chat":
-		return renderChatEntry(entry, continuation, quoted, selfHandle)
+		return renderChatEntry(entry, continuation, selfHandle)
 	case "join":
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("→ " + entry.SenderName + " joined")
 	case "leave":
@@ -1185,47 +1057,6 @@ func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, quote
 		}
 		return ""
 	}
-}
-
-func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
-	switch entry.Kind {
-	case "chat":
-		mentionBadge := ""
-		if selfHandle != "" && !entry.Local && mentionsHandle(entry.Body, selfHandle) {
-			mentionBadge = " @you"
-		}
-		quote := renderReplyQuotePlain(entry, quoted)
-		if continuation {
-			if quote != "" {
-				return quote + "\n" + entry.Body
-			}
-			return entry.Body
-		}
-		header := entry.SentAt.Format("15:04") + " · " + entry.SenderName + mentionBadge
-		if quote != "" {
-			return header + "\n" + quote + "\n" + entry.Body
-		}
-		return header + "\n" + entry.Body
-	case "join":
-		return "→ " + entry.SenderName + " joined"
-	case "leave":
-		return "← " + entry.SenderName + " left"
-	default:
-		return entry.Body
-	}
-}
-
-func renderTranscriptEntrySelected(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
-	block := renderTranscriptEntryPlain(entry, continuation, quoted, selfHandle)
-	lines := strings.Split(block, "\n")
-	if len(lines) == 0 {
-		return block
-	}
-	lines[0] = "▶ " + lines[0]
-	for i := 1; i < len(lines); i++ {
-		lines[i] = "  " + lines[i]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func copyInviteCmd(invite model.Invite) tea.Cmd {
@@ -1258,13 +1089,13 @@ func (m *modelUI) homeFooterHelp() string {
 }
 
 func (m *modelUI) chatFooterHelp() string {
-	parts := []string{"tab focus", "enter send"}
+	parts := []string{"enter send", "tab complete @mention"}
 	if m.keyDisambiguation {
 		parts = append(parts, "shift+enter newline")
 	} else {
 		parts = append(parts, "multiline unavailable in this terminal")
 	}
-	parts = append(parts, "↑↓ select msg", "r reply", "ctrl+r cancel reply", "pgup/pgdn scroll", "esc back")
+	parts = append(parts, "pgup/pgdn scroll", "esc back")
 	return strings.Join(parts, " · ")
 }
 
@@ -1340,7 +1171,6 @@ func sameTranscriptEntries(left, right []model.TranscriptEntry) bool {
 			left[i].SenderPeerID != right[i].SenderPeerID ||
 			left[i].SenderName != right[i].SenderName ||
 			left[i].Body != right[i].Body ||
-			left[i].ReplyTo != right[i].ReplyTo ||
 			!left[i].SentAt.Equal(right[i].SentAt) ||
 			left[i].Local != right[i].Local {
 			return false
@@ -1351,10 +1181,6 @@ func sameTranscriptEntries(left, right []model.TranscriptEntry) bool {
 
 func (m *modelUI) renderComposerArea() string {
 	var parts []string
-	if m.replyTo != nil {
-		parts = append(parts, accentStyle.Render("Replying to "+m.replyTo.SenderName)+mutedStyle.Render(" · ctrl+r cancel"))
-		parts = append(parts, mutedStyle.Render(oneLineBody(m.replyTo.Body)))
-	}
 	if hint := m.mentionCompletionHint(); hint != "" {
 		parts = append(parts, accentStyle.Render(hint))
 	}
@@ -1427,19 +1253,7 @@ func (m *modelUI) selectedSwarmSummary() *app.SwarmSummary {
 }
 
 func (m *modelUI) updateComposerPlaceholder() {
-	if m.replyTo != nil {
-		m.composer.Placeholder = "Reply to " + m.replyTo.SenderName + "..."
-		return
-	}
 	m.composer.Placeholder = "Type a message..."
-}
-
-func (m *modelUI) selectedTranscriptEntry() *model.TranscriptEntry {
-	if len(m.state.Transcript) == 0 || m.transcriptIdx < 0 || m.transcriptIdx >= len(m.state.Transcript) {
-		return nil
-	}
-	entry := m.state.Transcript[m.transcriptIdx]
-	return &entry
 }
 
 func (m *modelUI) applyMentionCompletion() bool {
@@ -1604,37 +1418,6 @@ func cleanMentionToken(value string) string {
 	return strings.Trim(strings.TrimPrefix(value, "@"), ".,:;!?()[]{}<>\"'")
 }
 
-func renderReplyQuote(entry model.TranscriptEntry, quoted map[string]model.TranscriptEntry) string {
-	if strings.TrimSpace(entry.ReplyTo) == "" {
-		return ""
-	}
-	target, ok := quoted[entry.ReplyTo]
-	if !ok || strings.TrimSpace(target.Body) == "" {
-		return mutedStyle.Render("↪ reply to an earlier message")
-	}
-	return mutedStyle.Render("↪ " + target.SenderName + ": " + oneLineBody(target.Body))
-}
-
-func renderReplyQuotePlain(entry model.TranscriptEntry, quoted map[string]model.TranscriptEntry) string {
-	if strings.TrimSpace(entry.ReplyTo) == "" {
-		return ""
-	}
-	target, ok := quoted[entry.ReplyTo]
-	if !ok || strings.TrimSpace(target.Body) == "" {
-		return "↪ reply to an earlier message"
-	}
-	return "↪ " + target.SenderName + ": " + oneLineBody(target.Body)
-}
-
-func oneLineBody(body string) string {
-	body = strings.Join(strings.Fields(strings.ReplaceAll(body, "\n", " ")), " ")
-	runes := []rune(body)
-	if len(runes) > 72 {
-		return string(runes[:72]) + "..."
-	}
-	return body
-}
-
 func (m *modelUI) highlightedSwarmID() string {
 	if swarm := m.selectedSwarm(); swarm != nil {
 		return swarm.Swarm.ID
@@ -1683,16 +1466,6 @@ func (m *modelUI) restoreHighlightedNearby(previous string) {
 	if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
 		m.nearbyIdx = len(m.state.Nearby) - 1
 	}
-}
-
-func (m *modelUI) transcriptGutter(ctx viewport.GutterContext) string {
-	if m.focus != "transcript" {
-		return " "
-	}
-	if ctx.Index >= m.transcriptSel.StartLine && ctx.Index <= m.transcriptSel.EndLine {
-		return lipgloss.NewStyle().Foreground(colorAccent).Render("▎")
-	}
-	return " "
 }
 
 func (m *modelUI) notifyTyping(active bool) {

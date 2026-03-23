@@ -55,7 +55,6 @@ type TranscriptEntry struct {
 	SenderPeerID string    `json:"sender_peer_id"`
 	SenderName   string    `json:"sender_name"`
 	Body         string    `json:"body"`
-	ReplyTo      string    `json:"reply_to,omitempty"`
 	SentAt       time.Time `json:"sent_at"`
 	Local        bool      `json:"local,omitempty"`
 }

@@ -199,9 +199,8 @@ type envelope struct {
 }
 
 type envelopeBody struct {
-	Body    string `json:"body,omitempty"`
-	ReplyTo string `json:"reply_to,omitempty"`
-	Typing  *bool  `json:"typing,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Typing *bool  `json:"typing,omitempty"`
 }
 
 // New creates a node with a persisted identity.
@@ -476,7 +475,7 @@ func (n *Node) CloseAllSwarms() error {
 }
 
 // PublishChat encrypts and publishes a chat message to the given swarm.
-func (n *Node) PublishChat(swarmID, body, replyTo string) error {
+func (n *Node) PublishChat(swarmID, body string) error {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return nil
@@ -488,8 +487,7 @@ func (n *Node) PublishChat(swarmID, body, replyTo string) error {
 	messageID := mustID()
 	sentAt := time.Now()
 	env, err := n.newEnvelope(active, "chat", envelopeBody{
-		Body:    body,
-		ReplyTo: sanitizeReplyTo(replyTo),
+		Body: body,
 	}, messageID, sentAt)
 	if err != nil {
 		return err
@@ -497,7 +495,7 @@ func (n *Node) PublishChat(swarmID, body, replyTo string) error {
 	if err := n.publishEnvelope(active, env); err != nil {
 		return err
 	}
-	entry := transcriptEntryFromEnvelope(active.Swarm.ID, n.host.ID().String(), env, body, sanitizeReplyTo(replyTo), true)
+	entry := transcriptEntryFromEnvelope(active.Swarm.ID, n.host.ID().String(), env, body, true)
 	n.emit(Event{Kind: EventTranscript, Entry: &entry})
 	n.touchPresence(active, selfPresence(n.selfPeer()))
 	_ = n.PublishTyping(swarmID, false)
@@ -979,7 +977,6 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				SenderPeerID: senderPeerID,
 				SenderName:   senderName,
 				Body:         body,
-				ReplyTo:      sanitizeReplyTo(payload.ReplyTo),
 				SentAt:       sentAt,
 			}
 			n.emit(Event{Kind: EventTranscript, Entry: &entry})
@@ -1097,7 +1094,6 @@ func (n *Node) newEnvelope(active *activeSwarm, kind string, payload envelopeBod
 		if !ok {
 			return envelope{}, fmt.Errorf("chat body exceeds %d bytes", maxChatBodyBytes)
 		}
-		payload.ReplyTo = sanitizeReplyTo(payload.ReplyTo)
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -1135,7 +1131,7 @@ func (n *Node) publishEnvelope(active *activeSwarm, env envelope) error {
 	return nil
 }
 
-func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelope, body, replyTo string, local bool) model.TranscriptEntry {
+func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelope, body string, local bool) model.TranscriptEntry {
 	return model.TranscriptEntry{
 		ID:           env.ID,
 		SwarmID:      swarmID,
@@ -1143,7 +1139,6 @@ func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelo
 		SenderPeerID: senderPeerID,
 		SenderName:   env.SenderName,
 		Body:         body,
-		ReplyTo:      sanitizeReplyTo(replyTo),
 		SentAt:       env.SentAt,
 		Local:        local,
 	}
@@ -1711,10 +1706,6 @@ func sanitizeChatBody(body string) (string, bool) {
 		return "", false
 	}
 	return body, true
-}
-
-func sanitizeReplyTo(value string) string {
-	return strings.TrimSpace(value)
 }
 
 func clampEventTime(sentAt time.Time) time.Time {

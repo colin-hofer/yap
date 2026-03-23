@@ -392,14 +392,14 @@ func (s *Service) ResolveApproval(id string, accept bool) error {
 }
 
 // SendChat publishes a chat message to the selected swarm.
-func (s *Service) SendChat(body, replyTo string) error {
+func (s *Service) SendChat(body string) error {
 	s.mu.RLock()
 	selectedID := s.selectedID
 	s.mu.RUnlock()
 	if strings.TrimSpace(selectedID) == "" {
 		return fmt.Errorf("no swarm selected")
 	}
-	return s.node.PublishChat(selectedID, body, replyTo)
+	return s.node.PublishChat(selectedID, body)
 }
 
 // NotifyTyping publishes ephemeral typing state for the selected swarm.
@@ -985,7 +985,6 @@ func mergeTranscriptEntries(existing, incoming []model.TranscriptEntry) ([]model
 		if _, ok := known[entry.ID]; ok {
 			continue
 		}
-		entry.ReplyTo = strings.TrimSpace(entry.ReplyTo)
 		known[entry.ID] = struct{}{}
 		merged = append(merged, entry)
 		added = append(added, entry)
