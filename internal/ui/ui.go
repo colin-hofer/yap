@@ -25,23 +25,26 @@ var (
 	colorMuted   = lipgloss.Color("#6A7A87")
 	colorAccent  = lipgloss.Color("#7FDBB6")
 	colorAccent2 = lipgloss.Color("#F2C879")
-	colorBorder  = lipgloss.Color("#31424D")
+	colorBorder  = lipgloss.Color("#2A3842")
+	colorFocus   = lipgloss.Color("#4A9E80")
 	colorStrong  = lipgloss.Color("#E8F0F2")
 	colorDanger  = lipgloss.Color("#F16E5B")
 	colorSelf    = lipgloss.Color("#9AD1FF")
-	colorPeer    = lipgloss.Color("#F4F7F8")
+	colorPeer    = lipgloss.Color("#D4DDE0")
 	colorJoin    = lipgloss.Color("#9BE48D")
 	colorLeave   = lipgloss.Color("#FFB199")
 	colorStale   = lipgloss.Color("#E0BE75")
+	colorSelBg   = lipgloss.Color("#1E3040")
 
-	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
-	modalStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
-	titleStyle    = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	mutedStyle    = lipgloss.NewStyle().Foreground(colorMuted)
-	accentStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
-	statusStyle   = lipgloss.NewStyle().Foreground(colorAccent2)
-	dangerStyle   = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
-	selectedStyle = lipgloss.NewStyle().Foreground(colorStrong).Background(lipgloss.Color("#24343E")).Padding(0, 1)
+	panelStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
+	focusedPanelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorFocus).Padding(1, 2)
+	modalStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
+	titleStyle        = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	mutedStyle        = lipgloss.NewStyle().Foreground(colorMuted)
+	accentStyle       = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	statusStyle       = lipgloss.NewStyle().Foreground(colorAccent2)
+	dangerStyle       = lipgloss.NewStyle().Foreground(colorDanger).Bold(true)
+	selectedStyle     = lipgloss.NewStyle().Foreground(colorStrong).Background(colorSelBg).Padding(0, 1)
 )
 
 // Run starts the Bubble Tea program.
@@ -672,9 +675,10 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 
 func (m *modelUI) renderHome(width, height int) string {
 	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
-		titleStyle.Render("yap") + mutedStyle.Render("  ") +
+		titleStyle.Render("yap") +
+			mutedStyle.Render(" · ") +
 			lipgloss.NewStyle().Foreground(colorStrong).Bold(true).Render(m.state.Identity.Name) +
-			mutedStyle.Render("  "+shortID(m.state.Identity.PeerID)),
+			mutedStyle.Render(" · "+shortID(m.state.Identity.PeerID)),
 	)
 
 	leftWidth := width / 2
@@ -687,14 +691,20 @@ func (m *modelUI) renderHome(width, height int) string {
 	}
 
 	panelHeight := height - 6
-	swarms := panelStyle.Width(leftWidth).Height(panelHeight).Render(m.renderSwarms())
-	nearby := panelStyle.Width(rightWidth).Height(panelHeight).Render(m.renderNearby())
+	leftStyle, rightStyle := panelStyle, panelStyle
+	if m.focus == "swarms" {
+		leftStyle = focusedPanelStyle
+	} else {
+		rightStyle = focusedPanelStyle
+	}
+	swarms := leftStyle.Width(leftWidth).Height(panelHeight).Render(m.renderSwarms())
+	nearby := rightStyle.Width(rightWidth).Height(panelHeight).Render(m.renderNearby())
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, swarms, nearby)
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
 		statusStyle.Render(m.status) + "\n" +
-			mutedStyle.Render("tab focus  ·  ↑↓ select  ·  enter open  ·  n new  ·  i invite  ·  j join  ·  d remove  ·  u update  ·  q quit"),
+			mutedStyle.Render("tab focus · ↑↓ select · enter open · n new · i invite · j join · d remove · u update · q quit"),
 	)
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 }
@@ -707,20 +717,32 @@ func (m *modelUI) renderSwarms() string {
 		return strings.Join(lines, "\n")
 	}
 	for i, swarm := range m.state.Swarms {
-		label := fmt.Sprintf("%s%s  %s", swarmStatus(swarm), swarm.Swarm.Name, mutedStyle.Render(shortID(swarm.Swarm.ID)))
-		if i == m.swarmIdx && m.focus == "swarms" {
-			label = selectedStyle.Render(label)
+		selected := i == m.swarmIdx && m.focus == "swarms"
+
+		dot := "●"
+		if !swarm.Connected {
+			dot = "○"
 		}
-		lines = append(lines, "")
-		lines = append(lines, label)
-		meta := fmt.Sprintf("%d peers", len(swarm.Swarm.TrustedPeers))
+		name := swarm.Swarm.Name
+		id := shortID(swarm.Swarm.ID)
+
+		var label string
+		if selected {
+			label = selectedStyle.Render(dot + " " + name + "  " + id)
+		} else {
+			label = swarmDot(swarm) + name + "  " + mutedStyle.Render(id)
+		}
+		lines = append(lines, "", label)
+
+		var metaParts []string
+		metaParts = append(metaParts, fmt.Sprintf("%d peers", len(swarm.Swarm.TrustedPeers)))
 		if swarm.Unread > 0 {
-			meta += fmt.Sprintf(" · %d unread", swarm.Unread)
+			metaParts = append(metaParts, accentStyle.Render(fmt.Sprintf("%d unread", swarm.Unread)))
 		}
 		if !swarm.LastActivity.IsZero() {
-			meta += " · " + swarm.LastActivity.Format("Jan 2 15:04")
+			metaParts = append(metaParts, swarm.LastActivity.Format("Jan 2 15:04"))
 		}
-		lines = append(lines, mutedStyle.Render(meta))
+		lines = append(lines, mutedStyle.Render("  ")+mutedStyle.Render(strings.Join(metaParts, mutedStyle.Render(" · "))))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -733,13 +755,17 @@ func (m *modelUI) renderNearby() string {
 		return strings.Join(lines, "\n")
 	}
 	for i, peerInfo := range m.state.Nearby {
-		label := nearbyLabel(peerInfo)
-		if i == m.nearbyIdx && m.focus == "nearby" {
-			label = selectedStyle.Render(label)
+		selected := i == m.nearbyIdx && m.focus == "nearby"
+		name := nearbyLabel(peerInfo)
+
+		var label string
+		if selected {
+			label = selectedStyle.Render(name)
+		} else {
+			label = lipgloss.NewStyle().Foreground(colorStrong).Render(name)
 		}
-		lines = append(lines, "")
-		lines = append(lines, label)
-		lines = append(lines, mutedStyle.Render(shortID(peerInfo.PeerID)+"  seen "+peerInfo.LastSeen.Format("15:04")))
+		lines = append(lines, "", label)
+		lines = append(lines, mutedStyle.Render("  "+shortID(peerInfo.PeerID)+" · seen "+peerInfo.LastSeen.Format("15:04")))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -761,7 +787,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
 		titleStyle.Render(active.Name) +
-			mutedStyle.Render(fmt.Sprintf("  %d %s", peerCount, peerWord)) +
+			mutedStyle.Render(fmt.Sprintf(" · %d %s", peerCount, peerWord)) +
 			"  " + statusStyle.Render(m.status),
 	)
 
@@ -779,9 +805,13 @@ func (m *modelUI) renderChat(width, height int) string {
 	m.messages.SetHeight(msgHeight)
 	m.composer.SetWidth(mainWidth - 6)
 
-	panelHeight := msgHeight + 4 // viewport + gap + composer fits exactly; layout totals to terminal height
+	panelHeight := msgHeight + 4
 
-	main := panelStyle.Width(mainWidth).Height(panelHeight).Render(
+	mainStyle := focusedPanelStyle
+	if m.focus == "transcript" {
+		mainStyle = focusedPanelStyle
+	}
+	main := mainStyle.Width(mainWidth).Height(panelHeight).Render(
 		m.messages.View() + "\n\n" + m.composer.View(),
 	)
 
@@ -792,7 +822,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
-		mutedStyle.Render("tab focus  ·  enter send  ·  shift+enter newline  ·  y copy  ·  pgup/pgdn scroll  ·  d remove  ·  esc back  ·  ctrl+c quit"),
+		mutedStyle.Render("tab focus · enter send · shift+enter newline · y copy · pgup/pgdn scroll · d remove · esc back"),
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -812,7 +842,13 @@ func (m *modelUI) renderPresence() string {
 			name = shortID(presence.PeerID)
 		}
 		dot := presenceDot(presence.State)
-		lines = append(lines, dot+"  "+lipgloss.NewStyle().Foreground(colorStrong).Render(name))
+		nameColor := colorStrong
+		if presence.State == "stale" {
+			nameColor = colorStale
+		} else if presence.State == "offline" {
+			nameColor = colorMuted
+		}
+		lines = append(lines, dot+" "+lipgloss.NewStyle().Foreground(nameColor).Render(name))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -826,9 +862,12 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 		lines = append(lines, mutedStyle.Render("No messages yet."))
 	}
 	for i, entry := range entries {
-		block := renderTranscriptEntry(entry)
-		if i == m.transcriptIdx && m.focus == "transcript" {
-			block = selectedStyle.Render(block)
+		selected := i == m.transcriptIdx && m.focus == "transcript"
+		var block string
+		if selected {
+			block = selectedStyle.Render(renderTranscriptEntryPlain(entry))
+		} else {
+			block = renderTranscriptEntry(entry)
 		}
 		switch entry.Kind {
 		case "chat", "join", "leave":
@@ -909,14 +948,15 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 }
 
 func renderChatEntry(entry model.TranscriptEntry) string {
-	header := mutedStyle.Render(entry.SentAt.Format("15:04")) + "  "
+	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
+	sep := mutedStyle.Render(" · ")
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
 		nameStyle = lipgloss.NewStyle().Foreground(colorSelf).Bold(true)
 		bodyStyle = lipgloss.NewStyle().Foreground(colorSelf)
 	}
-	return header + nameStyle.Render(entry.SenderName) + "\n" + bodyStyle.Render(entry.Body)
+	return ts + sep + nameStyle.Render(entry.SenderName) + "\n" + bodyStyle.Render(entry.Body)
 }
 
 func renderTranscriptEntry(entry model.TranscriptEntry) string {
@@ -924,14 +964,27 @@ func renderTranscriptEntry(entry model.TranscriptEntry) string {
 	case "chat":
 		return renderChatEntry(entry)
 	case "join":
-		return lipgloss.NewStyle().Foreground(colorJoin).Render(fmt.Sprintf("%s joined", entry.SenderName))
+		return lipgloss.NewStyle().Foreground(colorJoin).Render("→ " + entry.SenderName + " joined")
 	case "leave":
-		return lipgloss.NewStyle().Foreground(colorLeave).Render(fmt.Sprintf("%s left", entry.SenderName))
+		return lipgloss.NewStyle().Foreground(colorLeave).Render("← " + entry.SenderName + " left")
 	default:
 		if strings.TrimSpace(entry.Body) != "" {
 			return mutedStyle.Render(entry.Body)
 		}
 		return ""
+	}
+}
+
+func renderTranscriptEntryPlain(entry model.TranscriptEntry) string {
+	switch entry.Kind {
+	case "chat":
+		return entry.SentAt.Format("15:04") + " · " + entry.SenderName + "\n" + entry.Body
+	case "join":
+		return "→ " + entry.SenderName + " joined"
+	case "leave":
+		return "← " + entry.SenderName + " left"
+	default:
+		return entry.Body
 	}
 }
 
@@ -969,7 +1022,7 @@ func copyTranscriptText(entry model.TranscriptEntry) string {
 	}
 }
 
-func swarmStatus(swarm app.SwarmSummary) string {
+func swarmDot(swarm app.SwarmSummary) string {
 	if swarm.Connected {
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("● ")
 	}
