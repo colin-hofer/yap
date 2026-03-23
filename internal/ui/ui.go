@@ -1800,7 +1800,7 @@ func (m *modelUI) dismissModal() {
 		m.modalQueue = m.modalQueue[1:]
 		return
 	}
-	m.dismissModal()
+	m.modal = modalState{}
 }
 
 func displayVersion(value string) string {
