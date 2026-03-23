@@ -420,19 +420,6 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, copyTranscriptCmd(*entry)
 		}
-	case "d":
-		if m.state.SelectedSwarm == nil {
-			m.status = "no swarm selected"
-			return m, nil
-		}
-		m.modal = modalState{
-			Kind:      "remove",
-			Title:     "Remove Swarm",
-			Message:   fmt.Sprintf("Forget %s on this device and delete its local transcript?", m.state.SelectedSwarm.Name),
-			SwarmID:   m.state.SelectedSwarm.ID,
-			SwarmName: m.state.SelectedSwarm.Name,
-		}
-		return m, nil
 	case "enter":
 		if m.focus == "transcript" {
 			return m, nil
@@ -822,7 +809,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
-		mutedStyle.Render("tab focus · enter send · shift+enter newline · y copy · pgup/pgdn scroll · d remove · esc back"),
+		mutedStyle.Render("tab focus · enter send · shift+enter newline · y copy · pgup/pgdn scroll · esc back"),
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)

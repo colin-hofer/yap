@@ -117,7 +117,6 @@ yap version
 - `shift+enter`: insert a newline
 - `tab`: switch focus between the transcript and composer
 - `y`: copy the focused transcript entry
-- `d`: remove the current swarm locally
 - `esc`: leave the current chat and return to the home screen
 - `ctrl+c`: quit
 
