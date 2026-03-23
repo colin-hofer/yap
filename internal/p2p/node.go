@@ -46,6 +46,8 @@ const (
 	cardStreamTimeout    = 5 * time.Second
 	pairStreamTimeout    = 2 * time.Minute
 	historyStreamTimeout = 15 * time.Second
+	typingEvery          = 3 * time.Second
+	typingExpireAfter    = 6 * time.Second
 	maxDisplayNameBytes  = 64
 	maxChatBodyBytes     = 4096
 	maxPeerAddrs         = 16
@@ -118,6 +120,8 @@ type Node struct {
 	seen             map[string]struct{}
 	seenOrder        []string
 	historySync      map[string]time.Time
+	typingSent       map[string]time.Time
+	typingState      map[string]bool
 }
 
 type nearbyCandidate struct {
@@ -146,6 +150,8 @@ type presenceRecord struct {
 	Fingerprint string
 	State       string
 	LastSeen    time.Time
+	TypingUntil time.Time
+	ClearTyping bool
 }
 
 type wirePeer struct {
@@ -193,7 +199,9 @@ type envelope struct {
 }
 
 type envelopeBody struct {
-	Body string `json:"body,omitempty"`
+	Body    string `json:"body,omitempty"`
+	ReplyTo string `json:"reply_to,omitempty"`
+	Typing  *bool  `json:"typing,omitempty"`
 }
 
 // New creates a node with a persisted identity.
@@ -249,6 +257,8 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		seen:             make(map[string]struct{}),
 		seenOrder:        make([]string, 0, maxSeenIDs),
 		historySync:      make(map[string]time.Time),
+		typingSent:       make(map[string]time.Time),
+		typingState:      make(map[string]bool),
 	}
 
 	h.SetStreamHandler(cardProtocolID, node.handleCardStream)
@@ -433,6 +443,7 @@ func (n *Node) CloseSwarm(swarmID string) error {
 		return nil
 	}
 	_ = n.publishKind(active, "leave", "")
+	_ = n.publishTypingState(active, false)
 	active.Cancel()
 	active.Sub.Cancel()
 	if err := active.Topic.Close(); err != nil {
@@ -454,6 +465,7 @@ func (n *Node) CloseAllSwarms() error {
 	var closeErr error
 	for _, session := range active {
 		_ = n.publishKind(session, "leave", "")
+		_ = n.publishTypingState(session, false)
 		session.Cancel()
 		session.Sub.Cancel()
 		if err := session.Topic.Close(); err != nil && closeErr == nil {
@@ -464,7 +476,7 @@ func (n *Node) CloseAllSwarms() error {
 }
 
 // PublishChat encrypts and publishes a chat message to the given swarm.
-func (n *Node) PublishChat(swarmID, body string) error {
+func (n *Node) PublishChat(swarmID, body, replyTo string) error {
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return nil
@@ -475,16 +487,77 @@ func (n *Node) PublishChat(swarmID, body string) error {
 	}
 	messageID := mustID()
 	sentAt := time.Now()
-	env, err := n.newEnvelope(active, "chat", body, messageID, sentAt)
+	env, err := n.newEnvelope(active, "chat", envelopeBody{
+		Body:    body,
+		ReplyTo: sanitizeReplyTo(replyTo),
+	}, messageID, sentAt)
 	if err != nil {
 		return err
 	}
 	if err := n.publishEnvelope(active, env); err != nil {
 		return err
 	}
-	entry := transcriptEntryFromEnvelope(active.Swarm.ID, n.host.ID().String(), env, body, true)
+	entry := transcriptEntryFromEnvelope(active.Swarm.ID, n.host.ID().String(), env, body, sanitizeReplyTo(replyTo), true)
 	n.emit(Event{Kind: EventTranscript, Entry: &entry})
 	n.touchPresence(active, selfPresence(n.selfPeer()))
+	_ = n.PublishTyping(swarmID, false)
+	return nil
+}
+
+// PublishTyping broadcasts a throttled ephemeral typing state for the given swarm.
+func (n *Node) PublishTyping(swarmID string, active bool) error {
+	if strings.TrimSpace(swarmID) == "" {
+		return nil
+	}
+	session := n.currentSwarm(swarmID)
+	if session == nil {
+		return nil
+	}
+	return n.publishTypingState(session, active)
+}
+
+func (n *Node) publishTypingState(session *activeSwarm, active bool) error {
+	if session == nil {
+		return nil
+	}
+	swarmID := session.Swarm.ID
+	now := time.Now()
+	n.mu.Lock()
+	last := n.typingSent[swarmID]
+	lastState := n.typingState[swarmID]
+	if active == lastState {
+		if !active || now.Sub(last) < typingEvery {
+			n.mu.Unlock()
+			return nil
+		}
+	}
+	n.typingSent[swarmID] = now
+	n.typingState[swarmID] = active
+	n.mu.Unlock()
+
+	env, err := n.newEnvelope(session, "typing", envelopeBody{
+		Typing: boolPtr(active),
+	}, "", now)
+	if err != nil {
+		return err
+	}
+	if err := n.publishEnvelope(session, env); err != nil {
+		return err
+	}
+
+	update := presenceRecord{
+		PeerID:      n.host.ID().String(),
+		Name:        sanitizeDisplayName(n.identity.Name),
+		Fingerprint: n.identity.Fingerprint,
+		State:       "online",
+		LastSeen:    now,
+	}
+	if active {
+		update.TypingUntil = now.Add(typingExpireAfter)
+	} else {
+		update.ClearTyping = true
+	}
+	n.touchPresence(session, update)
 	return nil
 }
 
@@ -906,6 +979,7 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				SenderPeerID: senderPeerID,
 				SenderName:   senderName,
 				Body:         body,
+				ReplyTo:      sanitizeReplyTo(payload.ReplyTo),
 				SentAt:       sentAt,
 			}
 			n.emit(Event{Kind: EventTranscript, Entry: &entry})
@@ -915,6 +989,7 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				Fingerprint: senderFingerprint,
 				State:       "online",
 				LastSeen:    sentAt,
+				ClearTyping: true,
 			})
 		case "join", "leave":
 			entry := model.TranscriptEntry{
@@ -937,6 +1012,7 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				Fingerprint: senderFingerprint,
 				State:       state,
 				LastSeen:    sentAt,
+				ClearTyping: true,
 			})
 		case "heartbeat":
 			n.touchPresence(active, presenceRecord{
@@ -946,6 +1022,20 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				State:       "online",
 				LastSeen:    sentAt,
 			})
+		case "typing":
+			update := presenceRecord{
+				PeerID:      senderPeerID,
+				Name:        senderName,
+				Fingerprint: senderFingerprint,
+				State:       "online",
+				LastSeen:    sentAt,
+			}
+			if payload.Typing != nil && *payload.Typing {
+				update.TypingUntil = time.Now().Add(typingExpireAfter)
+			} else {
+				update.ClearTyping = true
+			}
+			n.touchPresence(active, update)
 		}
 	}
 }
@@ -993,22 +1083,23 @@ func (n *Node) presenceLoop(active *activeSwarm) {
 }
 
 func (n *Node) publishKind(active *activeSwarm, kind, body string) error {
-	env, err := n.newEnvelope(active, kind, body, "", time.Time{})
+	env, err := n.newEnvelope(active, kind, envelopeBody{Body: body}, "", time.Time{})
 	if err != nil {
 		return err
 	}
 	return n.publishEnvelope(active, env)
 }
 
-func (n *Node) newEnvelope(active *activeSwarm, kind, body, id string, sentAt time.Time) (envelope, error) {
+func (n *Node) newEnvelope(active *activeSwarm, kind string, payload envelopeBody, id string, sentAt time.Time) (envelope, error) {
 	if kind == "chat" {
 		var ok bool
-		body, ok = sanitizeChatBody(body)
+		payload.Body, ok = sanitizeChatBody(payload.Body)
 		if !ok {
 			return envelope{}, fmt.Errorf("chat body exceeds %d bytes", maxChatBodyBytes)
 		}
+		payload.ReplyTo = sanitizeReplyTo(payload.ReplyTo)
 	}
-	payloadBytes, err := json.Marshal(envelopeBody{Body: body})
+	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return envelope{}, fmt.Errorf("encode payload: %w", err)
 	}
@@ -1044,7 +1135,7 @@ func (n *Node) publishEnvelope(active *activeSwarm, env envelope) error {
 	return nil
 }
 
-func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelope, body string, local bool) model.TranscriptEntry {
+func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelope, body, replyTo string, local bool) model.TranscriptEntry {
 	return model.TranscriptEntry{
 		ID:           env.ID,
 		SwarmID:      swarmID,
@@ -1052,6 +1143,7 @@ func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelo
 		SenderPeerID: senderPeerID,
 		SenderName:   env.SenderName,
 		Body:         body,
+		ReplyTo:      sanitizeReplyTo(replyTo),
 		SentAt:       env.SentAt,
 		Local:        local,
 	}
@@ -1119,6 +1211,15 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 		record.State = update.State
 		changed = true
 	}
+	if update.ClearTyping {
+		if !record.TypingUntil.IsZero() {
+			record.TypingUntil = time.Time{}
+			changed = true
+		}
+	} else if !update.TypingUntil.IsZero() && !update.TypingUntil.Equal(record.TypingUntil) {
+		record.TypingUntil = update.TypingUntil
+		changed = true
+	}
 	n.mu.Unlock()
 	if !changed {
 		return
@@ -1137,6 +1238,10 @@ func (n *Node) refreshPresence(active *activeSwarm) {
 		if record.PeerID == n.host.ID().String() {
 			if record.State != "online" {
 				record.State = "online"
+				changed = true
+			}
+			if !record.TypingUntil.IsZero() && now.After(record.TypingUntil) {
+				record.TypingUntil = time.Time{}
 				changed = true
 			}
 			continue
@@ -1162,6 +1267,10 @@ func (n *Node) refreshPresence(active *activeSwarm) {
 			record.State = nextState
 			changed = true
 		}
+		if !record.TypingUntil.IsZero() && now.After(record.TypingUntil) {
+			record.TypingUntil = time.Time{}
+			changed = true
+		}
 	}
 	n.mu.Unlock()
 	if changed {
@@ -1171,13 +1280,16 @@ func (n *Node) refreshPresence(active *activeSwarm) {
 
 func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
 	n.mu.RLock()
+	now := time.Now()
 	presence := make([]model.Presence, 0, len(active.Presence))
 	for _, record := range active.Presence {
 		presence = append(presence, model.Presence{
 			PeerID:      record.PeerID,
 			Name:        record.Name,
 			Fingerprint: record.Fingerprint,
+			Addrs:       n.peerAddrs(record.PeerID),
 			State:       record.State,
+			Typing:      !record.TypingUntil.IsZero() && now.Before(record.TypingUntil),
 			LastSeen:    record.LastSeen,
 		})
 	}
@@ -1601,6 +1713,10 @@ func sanitizeChatBody(body string) (string, bool) {
 	return body, true
 }
 
+func sanitizeReplyTo(value string) string {
+	return strings.TrimSpace(value)
+}
+
 func clampEventTime(sentAt time.Time) time.Time {
 	now := time.Now()
 	if sentAt.IsZero() {
@@ -1635,6 +1751,24 @@ func (n *Node) peerFingerprint(author peer.ID) string {
 		}
 	}
 	return ""
+}
+
+func (n *Node) peerAddrs(peerID string) []string {
+	if strings.TrimSpace(peerID) == "" {
+		return nil
+	}
+	if peerID == n.host.ID().String() {
+		return sanitizePeerAddrs(multiaddrStrings(n.host.Addrs()))
+	}
+	decoded, err := peer.Decode(peerID)
+	if err != nil {
+		return nil
+	}
+	return sanitizePeerAddrs(multiaddrStrings(n.host.Peerstore().Addrs(decoded)))
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 type discoveryNotifee struct {

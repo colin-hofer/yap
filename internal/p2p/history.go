@@ -30,6 +30,7 @@ type wireTranscriptEntry struct {
 	SenderPeerID string    `json:"sender_peer_id"`
 	SenderName   string    `json:"sender_name"`
 	Body         string    `json:"body"`
+	ReplyTo      string    `json:"reply_to,omitempty"`
 	SentAt       time.Time `json:"sent_at"`
 }
 
@@ -198,6 +199,7 @@ func toWireTranscriptEntries(entries []model.TranscriptEntry) []wireTranscriptEn
 			SenderPeerID: entry.SenderPeerID,
 			SenderName:   sanitizeDisplayName(entry.SenderName),
 			Body:         body,
+			ReplyTo:      sanitizeReplyTo(entry.ReplyTo),
 			SentAt:       clampEventTime(entry.SentAt),
 		})
 	}
@@ -221,6 +223,7 @@ func fromWireTranscriptEntries(entries []wireTranscriptEntry, localPeerID string
 			SenderPeerID: entry.SenderPeerID,
 			SenderName:   sanitizeDisplayName(entry.SenderName),
 			Body:         body,
+			ReplyTo:      sanitizeReplyTo(entry.ReplyTo),
 			SentAt:       clampEventTime(entry.SentAt),
 			Local:        entry.SenderPeerID == localPeerID,
 		})

@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
@@ -134,5 +136,95 @@ func TestHandleHomeRenameOpensModal(t *testing.T) {
 	}
 	if got.prompt.Value() != "me" {
 		t.Fatalf("prompt.Value() = %q, want me", got.prompt.Value())
+	}
+}
+
+func TestHandleChatTabCompletesMentionBeforeChangingFocus(t *testing.T) {
+	composer := newTestComposer()
+	composer.SetValue("@pe")
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "composer",
+		state:    app.State{Identity: model.Identity{Name: "me", PeerID: "self"}, SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha", TrustedPeers: []model.TrustedPeer{{PeerID: "peer-1", Name: "Peer Name"}}}},
+		composer: composer,
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: tea.KeyTab})
+	got := modelOut.(*modelUI)
+
+	if got.focus != "composer" {
+		t.Fatalf("focus = %q, want composer", got.focus)
+	}
+	if got.composer.Value() != "@peer-name " {
+		t.Fatalf("composer.Value() = %q, want %q", got.composer.Value(), "@peer-name ")
+	}
+}
+
+func TestHandleChatReplyShortcutSelectsMessage(t *testing.T) {
+	composer := newTestComposer()
+
+	m := &modelUI{
+		mode:          "chat",
+		focus:         "transcript",
+		transcriptIdx: 0,
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Transcript: []model.TranscriptEntry{
+				{ID: "msg-1", Kind: "chat", SenderName: "Peer", Body: "hello"},
+			},
+		},
+		composer: composer,
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'r', Text: "r"})
+	got := modelOut.(*modelUI)
+
+	if got.focus != "composer" {
+		t.Fatalf("focus = %q, want composer", got.focus)
+	}
+	if got.replyTo == nil || got.replyTo.ID != "msg-1" {
+		t.Fatalf("replyTo = %#v, want msg-1", got.replyTo)
+	}
+}
+
+func TestRenderTranscriptShowsUnreadSeparatorAndReplyQuote(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha", LastOpened: time.Unix(15, 0)},
+		},
+	}
+
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "msg-1", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "hello there", SentAt: time.Unix(10, 0)},
+		{ID: "msg-2", Kind: "chat", SenderPeerID: "peer-2", SenderName: "Other", Body: "replying", ReplyTo: "msg-1", SentAt: time.Unix(20, 0)},
+	}, 80)
+
+	if !strings.Contains(content, "── new messages ──") {
+		t.Fatalf("renderTranscript() missing unread separator:\n%s", content)
+	}
+	if !strings.Contains(content, "↪ Peer: hello there") {
+		t.Fatalf("renderTranscript() missing reply quote:\n%s", content)
+	}
+}
+
+func TestConnectionSummaryReflectsPeerHealth(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Swarms:        []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha"}, Connected: true}},
+			Presence: []model.Presence{
+				{PeerID: "self", State: "online"},
+				{PeerID: "peer-1", State: "online"},
+				{PeerID: "peer-2", State: "stale"},
+			},
+		},
+	}
+
+	if got := m.connectionSummary(); got != "◉ 2 online · 1 stale" {
+		t.Fatalf("connectionSummary() = %q", got)
 	}
 }

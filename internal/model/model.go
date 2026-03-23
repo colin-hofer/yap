@@ -55,6 +55,7 @@ type TranscriptEntry struct {
 	SenderPeerID string    `json:"sender_peer_id"`
 	SenderName   string    `json:"sender_name"`
 	Body         string    `json:"body"`
+	ReplyTo      string    `json:"reply_to,omitempty"`
 	SentAt       time.Time `json:"sent_at"`
 	Local        bool      `json:"local,omitempty"`
 }
@@ -64,6 +65,8 @@ type Presence struct {
 	PeerID      string    `json:"peer_id"`
 	Name        string    `json:"name"`
 	Fingerprint string    `json:"fingerprint"`
+	Addrs       []string  `json:"addrs,omitempty"`
 	State       string    `json:"state"`
+	Typing      bool      `json:"typing,omitempty"`
 	LastSeen    time.Time `json:"last_seen"`
 }

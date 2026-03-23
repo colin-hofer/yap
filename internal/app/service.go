@@ -321,6 +321,7 @@ func (s *Service) OpenSwarm(ref string) error {
 
 // LeaveSwarm clears the current selection and returns to the home state.
 func (s *Service) LeaveSwarm() error {
+	_ = s.markSelectedSwarmRead(time.Now())
 	s.mu.Lock()
 	s.selectedID = ""
 	s.mu.Unlock()
@@ -391,18 +392,30 @@ func (s *Service) ResolveApproval(id string, accept bool) error {
 }
 
 // SendChat publishes a chat message to the selected swarm.
-func (s *Service) SendChat(body string) error {
+func (s *Service) SendChat(body, replyTo string) error {
 	s.mu.RLock()
 	selectedID := s.selectedID
 	s.mu.RUnlock()
 	if strings.TrimSpace(selectedID) == "" {
 		return fmt.Errorf("no swarm selected")
 	}
-	return s.node.PublishChat(selectedID, body)
+	return s.node.PublishChat(selectedID, body, replyTo)
+}
+
+// NotifyTyping publishes ephemeral typing state for the selected swarm.
+func (s *Service) NotifyTyping(active bool) {
+	s.mu.RLock()
+	selectedID := s.selectedID
+	s.mu.RUnlock()
+	if strings.TrimSpace(selectedID) == "" {
+		return
+	}
+	_ = s.node.PublishTyping(selectedID, active)
 }
 
 // Shutdown stops background work and closes the node.
 func (s *Service) Shutdown() error {
+	_ = s.markSelectedSwarmRead(time.Now())
 	s.cancel()
 	return s.node.Close()
 }
@@ -550,6 +563,7 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 			PeerID:      item.PeerID,
 			Name:        item.Name,
 			Fingerprint: item.Fingerprint,
+			Addrs:       append([]string(nil), item.Addrs...),
 		}
 		next := mergeTrustedPeer(swarm.TrustedPeers, peerInfo)
 		if !trustedPeersEqual(swarm.TrustedPeers, next) {
@@ -689,6 +703,15 @@ func (s *Service) snapshotLocked() State {
 			LastActivity: lastActivity,
 		})
 	}
+	sort.Slice(swarms, func(i, j int) bool {
+		if swarms[i].LastActivity.Equal(swarms[j].LastActivity) {
+			if swarms[i].Unread == swarms[j].Unread {
+				return strings.ToLower(swarms[i].Swarm.Name) < strings.ToLower(swarms[j].Swarm.Name)
+			}
+			return swarms[i].Unread > swarms[j].Unread
+		}
+		return swarms[i].LastActivity.After(swarms[j].LastActivity)
+	})
 
 	var selected *model.Swarm
 	if strings.TrimSpace(s.selectedID) != "" {
@@ -710,6 +733,30 @@ func (s *Service) snapshotLocked() State {
 		Transcript:    transcript,
 		Presence:      presence,
 	}
+}
+
+func (s *Service) markSelectedSwarmRead(seenAt time.Time) error {
+	s.mu.RLock()
+	selectedID := s.selectedID
+	s.mu.RUnlock()
+	if strings.TrimSpace(selectedID) == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	swarm, ok := s.findSwarmLocked(selectedID)
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	if !seenAt.After(swarm.LastOpened) {
+		seenAt = time.Now()
+	}
+	swarm.LastOpened = seenAt
+	s.unread[selectedID] = 0
+	s.replaceSwarmLocked(swarm)
+	s.mu.Unlock()
+	return s.store.SaveSwarm(swarm)
 }
 
 func (s *Service) reloadSwarmsLocked() error {
@@ -922,6 +969,7 @@ func mergeTranscriptEntries(existing, incoming []model.TranscriptEntry) ([]model
 		if _, ok := known[entry.ID]; ok {
 			continue
 		}
+		entry.ReplyTo = strings.TrimSpace(entry.ReplyTo)
 		known[entry.ID] = struct{}{}
 		merged = append(merged, entry)
 		added = append(added, entry)

@@ -84,6 +84,7 @@ type modelUI struct {
 	nearbyIdx     int
 	transcriptIdx int
 	status        string
+	replyTo       *model.TranscriptEntry
 
 	updateRequested   bool
 	checkingUpdate    bool
@@ -392,7 +393,15 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
+	case "ctrl+r":
+		if m.replyTo != nil {
+			m.replyTo = nil
+			m.updateComposerPlaceholder()
+			m.status = "reply canceled"
+			return m, nil
+		}
 	case "esc":
+		m.notifyTyping(false)
 		if err := m.service.LeaveSwarm(); err != nil {
 			m.status = err.Error()
 		}
@@ -402,6 +411,10 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "tab":
 		if m.focus == "composer" {
+			if m.applyMentionCompletion() {
+				m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
+				return m, nil
+			}
 			m.focus = "transcript"
 			m.composer.Blur()
 		} else {
@@ -409,6 +422,21 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.composer.Focus()
 		}
 		return m, nil
+	case "r":
+		if m.focus == "transcript" {
+			entry := m.selectedTranscriptEntry()
+			if entry == nil || entry.Kind != "chat" {
+				m.status = "select a chat message to reply"
+				return m, nil
+			}
+			copy := *entry
+			m.replyTo = &copy
+			m.focus = "composer"
+			m.composer.Focus()
+			m.updateComposerPlaceholder()
+			m.status = fmt.Sprintf("replying to %s", entry.SenderName)
+			return m, nil
+		}
 	case "up":
 		if m.focus == "transcript" && m.transcriptIdx > 0 {
 			m.transcriptIdx--
@@ -447,11 +475,18 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if body == "" {
 			return m, nil
 		}
-		if err := m.service.SendChat(body); err != nil {
+		replyTo := ""
+		if m.replyTo != nil {
+			replyTo = m.replyTo.ID
+		}
+		if err := m.service.SendChat(body, replyTo); err != nil {
 			m.status = err.Error()
 			return m, nil
 		}
 		m.composer.SetValue("")
+		m.replyTo = nil
+		m.updateComposerPlaceholder()
+		m.notifyTyping(false)
 		m.syncTranscript(true)
 		return m, nil
 	}
@@ -460,7 +495,12 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
 	var cmd tea.Cmd
+	before := m.composer.Value()
 	m.composer, cmd = m.composer.Update(msg)
+	if before != m.composer.Value() {
+		m.updateComposerPlaceholder()
+		m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
+	}
 	return m, cmd
 }
 
@@ -601,6 +641,8 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			return nil
 		}
 		prevState := m.state
+		prevSwarmID := m.highlightedSwarmID()
+		prevNearbyID := m.highlightedNearbyID()
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
@@ -613,17 +655,17 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			m.focus = "swarms"
 			m.composer.Blur()
 		}
-		if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
-			m.swarmIdx = len(m.state.Swarms) - 1
-		}
-		if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
-			m.nearbyIdx = len(m.state.Nearby) - 1
-		}
+		m.restoreHighlightedSwarm(prevSwarmID)
+		m.restoreHighlightedNearby(prevNearbyID)
 		if m.transcriptIdx >= len(m.state.Transcript) && len(m.state.Transcript) > 0 {
 			m.transcriptIdx = len(m.state.Transcript) - 1
 		}
 		if len(m.state.Transcript) == 0 {
 			m.transcriptIdx = 0
+		}
+		if selectedSwarmID(prevState) != selectedSwarmID(m.state) {
+			m.replyTo = nil
+			m.updateComposerPlaceholder()
 		}
 		m.syncLayout()
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
@@ -632,10 +674,18 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		return nil
 	case app.EventToast:
 		prevState := m.state
+		prevSwarmID := m.highlightedSwarmID()
+		prevNearbyID := m.highlightedNearbyID()
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
 		m.status = event.Message
+		if selectedSwarmID(prevState) != selectedSwarmID(m.state) {
+			m.replyTo = nil
+			m.updateComposerPlaceholder()
+		}
+		m.restoreHighlightedSwarm(prevSwarmID)
+		m.restoreHighlightedNearby(prevNearbyID)
 		m.syncLayout()
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
 			m.syncTranscript(false)
@@ -766,7 +816,7 @@ func (m *modelUI) renderSwarms() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render("Swarms"))
 	if len(m.state.Swarms) == 0 {
-		lines = append(lines, "", mutedStyle.Render("No swarms yet. Press n to create one."))
+		lines = append(lines, "", mutedStyle.Render("No swarms yet. Press n to create one or focus Nearby and press j to join with a code."))
 		return strings.Join(lines, "\n")
 	}
 	for i, swarm := range m.state.Swarms {
@@ -804,7 +854,7 @@ func (m *modelUI) renderNearby() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render("Nearby"))
 	if len(m.state.Nearby) == 0 {
-		lines = append(lines, "", mutedStyle.Render("Scanning..."))
+		lines = append(lines, "", mutedStyle.Render("Scanning for peers on your local network..."))
 		return strings.Join(lines, "\n")
 	}
 	for i, peerInfo := range m.state.Nearby {
@@ -841,7 +891,8 @@ func (m *modelUI) renderChat(width, height int) string {
 	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
 		titleStyle.Render(active.Name) +
 			mutedStyle.Render(fmt.Sprintf(" · %d %s", peerCount, peerWord)) +
-			"  " + statusStyle.Render(m.status),
+			"  " + statusStyle.Render(m.connectionSummary()) +
+			"  " + mutedStyle.Render(m.status),
 	)
 
 	sidebarWidth := 26
@@ -865,7 +916,7 @@ func (m *modelUI) renderChat(width, height int) string {
 		mainStyle = focusedPanelStyle
 	}
 	main := mainStyle.Width(mainWidth).Height(panelHeight).Render(
-		m.messages.View() + "\n\n" + m.composer.View(),
+		m.messages.View() + "\n\n" + m.renderComposerArea(),
 	)
 
 	body := main
@@ -901,7 +952,15 @@ func (m *modelUI) renderPresence() string {
 		} else if presence.State == "offline" {
 			nameColor = colorMuted
 		}
-		lines = append(lines, dot+" "+lipgloss.NewStyle().Foreground(nameColor).Render(name))
+		label := dot + " " + lipgloss.NewStyle().Foreground(nameColor).Render(name)
+		handle := mentionToken(name, presence.PeerID)
+		if handle != "" {
+			label += mutedStyle.Render("  @" + handle)
+		}
+		if presence.Typing && presence.PeerID != m.state.Identity.PeerID {
+			label += accentStyle.Render("  typing...")
+		}
+		lines = append(lines, label)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -914,9 +973,19 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 		return mutedStyle.Render("No messages yet.")
 	}
 	var b strings.Builder
+	quoted := make(map[string]model.TranscriptEntry, len(entries))
+	for _, entry := range entries {
+		quoted[entry.ID] = entry
+	}
 	prevSender := ""
 	prevKind := ""
+	prevReplyTo := ""
 	first := true
+	insertedUnread := false
+	lastOpened := time.Time{}
+	if m.state.SelectedSwarm != nil {
+		lastOpened = m.state.SelectedSwarm.LastOpened
+	}
 	for i, entry := range entries {
 		if entry.Kind != "chat" && entry.Kind != "join" && entry.Kind != "leave" {
 			if strings.TrimSpace(entry.Body) == "" {
@@ -924,8 +993,8 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 			}
 		}
 
-		// Consecutive chat messages from the same sender get collapsed.
-		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender
+		// Consecutive plain chat messages from the same sender get collapsed.
+		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender && entry.ReplyTo == "" && prevReplyTo == ""
 
 		if !first {
 			if sameSender {
@@ -934,13 +1003,21 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 				b.WriteString("\n\n")
 			}
 		}
+		if !insertedUnread && !lastOpened.IsZero() && entry.SentAt.After(lastOpened) {
+			if !first {
+				b.WriteString("\n\n")
+			}
+			b.WriteString(accentStyle.Render("── new messages ──"))
+			b.WriteString("\n\n")
+			insertedUnread = true
+		}
 
 		selected := i == m.transcriptIdx && m.focus == "transcript"
 		var block string
 		if selected {
-			block = selectedStyle.Render(renderTranscriptEntryPlain(entry, sameSender))
+			block = selectedStyle.Render(renderTranscriptEntryPlain(entry, sameSender, quoted, m.selfMentionHandle()))
 		} else {
-			block = renderTranscriptEntry(entry, sameSender)
+			block = renderTranscriptEntry(entry, sameSender, quoted, m.selfMentionHandle())
 		}
 		b.WriteString(block)
 
@@ -950,6 +1027,7 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 			prevSender = ""
 		}
 		prevKind = entry.Kind
+		prevReplyTo = entry.ReplyTo
 		first = false
 	}
 	return b.String()
@@ -1021,25 +1099,37 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 	return &peerInfo
 }
 
-func renderChatEntry(entry model.TranscriptEntry, continuation bool) string {
+func renderChatEntry(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
 		nameStyle = lipgloss.NewStyle().Foreground(colorSelf).Bold(true)
 		bodyStyle = lipgloss.NewStyle().Foreground(colorSelf)
 	}
+	mentionBadge := ""
+	if selfHandle != "" && !entry.Local && mentionsHandle(entry.Body, selfHandle) {
+		mentionBadge = accentStyle.Render(" @you")
+	}
+	quote := renderReplyQuote(entry, quoted)
 	if continuation {
+		if quote != "" {
+			return quote + "\n" + bodyStyle.Render(entry.Body)
+		}
 		return bodyStyle.Render(entry.Body)
 	}
 	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
 	sep := mutedStyle.Render(" · ")
-	return ts + sep + nameStyle.Render(entry.SenderName) + "\n" + bodyStyle.Render(entry.Body)
+	header := ts + sep + nameStyle.Render(entry.SenderName) + mentionBadge
+	if quote != "" {
+		return header + "\n" + quote + "\n" + bodyStyle.Render(entry.Body)
+	}
+	return header + "\n" + bodyStyle.Render(entry.Body)
 }
 
-func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool) string {
+func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
 	switch entry.Kind {
 	case "chat":
-		return renderChatEntry(entry, continuation)
+		return renderChatEntry(entry, continuation, quoted, selfHandle)
 	case "join":
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("→ " + entry.SenderName + " joined")
 	case "leave":
@@ -1052,13 +1142,25 @@ func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool) strin
 	}
 }
 
-func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool) string {
+func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
 	switch entry.Kind {
 	case "chat":
+		mentionBadge := ""
+		if selfHandle != "" && !entry.Local && mentionsHandle(entry.Body, selfHandle) {
+			mentionBadge = " @you"
+		}
+		quote := renderReplyQuotePlain(entry, quoted)
 		if continuation {
+			if quote != "" {
+				return quote + "\n" + entry.Body
+			}
 			return entry.Body
 		}
-		return entry.SentAt.Format("15:04") + " · " + entry.SenderName + "\n" + entry.Body
+		header := entry.SentAt.Format("15:04") + " · " + entry.SenderName + mentionBadge
+		if quote != "" {
+			return header + "\n" + quote + "\n" + entry.Body
+		}
+		return header + "\n" + entry.Body
 	case "join":
 		return "→ " + entry.SenderName + " joined"
 	case "leave":
@@ -1069,7 +1171,11 @@ func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool) 
 }
 
 func copyInviteCmd(invite model.Invite) tea.Cmd {
-	return copyTextCmd(invite.Code, "copied invite code")
+	status := "copied invite code"
+	if strings.TrimSpace(invite.SwarmName) != "" {
+		status = "copied invite code for " + invite.SwarmName
+	}
+	return copyTextCmd(invite.Code, status)
 }
 
 func copyTextCmd(text, status string) tea.Cmd {
@@ -1100,7 +1206,7 @@ func (m *modelUI) chatFooterHelp() string {
 	} else {
 		parts = append(parts, "multiline unavailable in this terminal")
 	}
-	parts = append(parts, "pgup/pgdn scroll", "esc back")
+	parts = append(parts, "r reply", "ctrl+r cancel reply", "pgup/pgdn scroll", "esc back")
 	return strings.Join(parts, " · ")
 }
 
@@ -1176,12 +1282,296 @@ func sameTranscriptEntries(left, right []model.TranscriptEntry) bool {
 			left[i].SenderPeerID != right[i].SenderPeerID ||
 			left[i].SenderName != right[i].SenderName ||
 			left[i].Body != right[i].Body ||
+			left[i].ReplyTo != right[i].ReplyTo ||
 			!left[i].SentAt.Equal(right[i].SentAt) ||
 			left[i].Local != right[i].Local {
 			return false
 		}
 	}
 	return true
+}
+
+func (m *modelUI) renderComposerArea() string {
+	var parts []string
+	if m.replyTo != nil {
+		parts = append(parts, accentStyle.Render("Replying to "+m.replyTo.SenderName)+mutedStyle.Render(" · ctrl+r cancel"))
+		parts = append(parts, mutedStyle.Render(oneLineBody(m.replyTo.Body)))
+	}
+	if typing := m.typingSummary(); typing != "" {
+		parts = append(parts, accentStyle.Render(typing))
+	}
+	parts = append(parts, m.composer.View())
+	return strings.Join(parts, "\n")
+}
+
+func (m *modelUI) typingSummary() string {
+	names := make([]string, 0, len(m.state.Presence))
+	for _, presence := range m.state.Presence {
+		if presence.PeerID == m.state.Identity.PeerID || !presence.Typing || presence.State == "offline" {
+			continue
+		}
+		name := strings.TrimSpace(presence.Name)
+		if name == "" {
+			name = shortID(presence.PeerID)
+		}
+		names = append(names, name)
+	}
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0] + " is typing..."
+	case 2:
+		return names[0] + " and " + names[1] + " are typing..."
+	default:
+		return fmt.Sprintf("%s and %d others are typing...", names[0], len(names)-1)
+	}
+}
+
+func (m *modelUI) connectionSummary() string {
+	selected := m.selectedSwarmSummary()
+	if selected == nil || !selected.Connected {
+		return "✕ offline"
+	}
+	online := 0
+	stale := 0
+	for _, presence := range m.state.Presence {
+		switch presence.State {
+		case "online":
+			online++
+		case "stale":
+			stale++
+		}
+	}
+	if online <= 1 {
+		return "◎ connecting..."
+	}
+	summary := fmt.Sprintf("◉ %d online", online)
+	if stale > 0 {
+		summary += fmt.Sprintf(" · %d stale", stale)
+	}
+	return summary
+}
+
+func (m *modelUI) selectedSwarmSummary() *app.SwarmSummary {
+	if m.state.SelectedSwarm == nil {
+		return nil
+	}
+	for i := range m.state.Swarms {
+		if m.state.Swarms[i].Swarm.ID == m.state.SelectedSwarm.ID {
+			return &m.state.Swarms[i]
+		}
+	}
+	return nil
+}
+
+func (m *modelUI) updateComposerPlaceholder() {
+	if m.replyTo != nil {
+		m.composer.Placeholder = "Reply to " + m.replyTo.SenderName + "..."
+		return
+	}
+	m.composer.Placeholder = "Type a message..."
+}
+
+func (m *modelUI) selectedTranscriptEntry() *model.TranscriptEntry {
+	if len(m.state.Transcript) == 0 || m.transcriptIdx < 0 || m.transcriptIdx >= len(m.state.Transcript) {
+		return nil
+	}
+	entry := m.state.Transcript[m.transcriptIdx]
+	return &entry
+}
+
+func (m *modelUI) applyMentionCompletion() bool {
+	if m.focus != "composer" {
+		return false
+	}
+	value := m.composer.Value()
+	if value == "" {
+		return false
+	}
+	start := strings.LastIndexAny(value, " \n\t")
+	token := value[start+1:]
+	if !strings.HasPrefix(token, "@") {
+		return false
+	}
+	prefix := strings.TrimPrefix(token, "@")
+	for _, candidate := range m.mentionCandidates() {
+		if prefix == "" || strings.HasPrefix(candidate, strings.ToLower(prefix)) {
+			m.composer.SetValue(value[:start+1] + "@" + candidate + " ")
+			return true
+		}
+	}
+	return false
+}
+
+func (m *modelUI) mentionCandidates() []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	appendCandidate := func(name, peerID string) {
+		handle := mentionToken(name, peerID)
+		if handle == "" {
+			return
+		}
+		if _, ok := seen[handle]; ok {
+			return
+		}
+		seen[handle] = struct{}{}
+		out = append(out, handle)
+	}
+	if m.state.SelectedSwarm != nil {
+		for _, trusted := range m.state.SelectedSwarm.TrustedPeers {
+			if trusted.PeerID == m.state.Identity.PeerID {
+				continue
+			}
+			appendCandidate(trusted.Name, trusted.PeerID)
+		}
+	}
+	for _, presence := range m.state.Presence {
+		if presence.PeerID == m.state.Identity.PeerID {
+			continue
+		}
+		appendCandidate(presence.Name, presence.PeerID)
+	}
+	return out
+}
+
+func (m *modelUI) selfMentionHandle() string {
+	return mentionToken(m.state.Identity.Name, m.state.Identity.PeerID)
+}
+
+func mentionToken(name, peerID string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return strings.ToLower(shortID(peerID))
+	}
+	var b strings.Builder
+	dashed := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			dashed = false
+		case r == '-' || r == '_':
+			if !dashed && b.Len() > 0 {
+				b.WriteRune(r)
+				dashed = true
+			}
+		default:
+			if !dashed && b.Len() > 0 {
+				b.WriteByte('-')
+				dashed = true
+			}
+		}
+	}
+	handle := strings.Trim(b.String(), "-_")
+	if handle == "" {
+		return strings.ToLower(shortID(peerID))
+	}
+	return handle
+}
+
+func mentionsHandle(body, handle string) bool {
+	if handle == "" {
+		return false
+	}
+	for _, token := range strings.Fields(body) {
+		if !strings.HasPrefix(token, "@") {
+			continue
+		}
+		candidate := strings.Trim(strings.TrimPrefix(token, "@"), ".,:;!?()[]{}<>\"'")
+		if strings.EqualFold(candidate, handle) {
+			return true
+		}
+	}
+	return false
+}
+
+func renderReplyQuote(entry model.TranscriptEntry, quoted map[string]model.TranscriptEntry) string {
+	if strings.TrimSpace(entry.ReplyTo) == "" {
+		return ""
+	}
+	target, ok := quoted[entry.ReplyTo]
+	if !ok || strings.TrimSpace(target.Body) == "" {
+		return mutedStyle.Render("↪ reply to an earlier message")
+	}
+	return mutedStyle.Render("↪ " + target.SenderName + ": " + oneLineBody(target.Body))
+}
+
+func renderReplyQuotePlain(entry model.TranscriptEntry, quoted map[string]model.TranscriptEntry) string {
+	if strings.TrimSpace(entry.ReplyTo) == "" {
+		return ""
+	}
+	target, ok := quoted[entry.ReplyTo]
+	if !ok || strings.TrimSpace(target.Body) == "" {
+		return "↪ reply to an earlier message"
+	}
+	return "↪ " + target.SenderName + ": " + oneLineBody(target.Body)
+}
+
+func oneLineBody(body string) string {
+	body = strings.Join(strings.Fields(strings.ReplaceAll(body, "\n", " ")), " ")
+	runes := []rune(body)
+	if len(runes) > 72 {
+		return string(runes[:72]) + "..."
+	}
+	return body
+}
+
+func (m *modelUI) highlightedSwarmID() string {
+	if swarm := m.selectedSwarm(); swarm != nil {
+		return swarm.Swarm.ID
+	}
+	return ""
+}
+
+func (m *modelUI) highlightedNearbyID() string {
+	if peerInfo := m.selectedNearby(); peerInfo != nil {
+		return peerInfo.PeerID
+	}
+	return ""
+}
+
+func (m *modelUI) restoreHighlightedSwarm(previous string) {
+	if previous == "" {
+		if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
+			m.swarmIdx = len(m.state.Swarms) - 1
+		}
+		return
+	}
+	for i := range m.state.Swarms {
+		if m.state.Swarms[i].Swarm.ID == previous {
+			m.swarmIdx = i
+			return
+		}
+	}
+	if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
+		m.swarmIdx = len(m.state.Swarms) - 1
+	}
+}
+
+func (m *modelUI) restoreHighlightedNearby(previous string) {
+	if previous == "" {
+		if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
+			m.nearbyIdx = len(m.state.Nearby) - 1
+		}
+		return
+	}
+	for i := range m.state.Nearby {
+		if m.state.Nearby[i].PeerID == previous {
+			m.nearbyIdx = i
+			return
+		}
+	}
+	if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
+		m.nearbyIdx = len(m.state.Nearby) - 1
+	}
+}
+
+func (m *modelUI) notifyTyping(active bool) {
+	if m.service == nil {
+		return
+	}
+	m.service.NotifyTyping(active)
 }
 
 func displayVersion(value string) string {
