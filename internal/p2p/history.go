@@ -10,6 +10,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"yap/internal/model"
+	"yap/internal/store"
 )
 
 type historyRequest struct {
@@ -34,6 +35,7 @@ type wireTranscriptEntry struct {
 
 func (n *Node) handleHistoryStream(stream network.Stream) {
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(historyStreamTimeout))
 
 	var request historyRequest
 	if err := json.NewDecoder(stream).Decode(&request); err != nil {
@@ -57,6 +59,7 @@ func (n *Node) handleHistoryStream(stream network.Stream) {
 		_ = json.NewEncoder(stream).Encode(historyResponse{Error: "failed to load transcript"})
 		return
 	}
+	request.Entries = clampWireTranscriptEntries(request.Entries)
 	remoteEntries := fromWireTranscriptEntries(request.Entries, n.host.ID().String())
 	added, err := n.store.MergeTranscript(request.SwarmID, remoteEntries)
 	if err != nil {
@@ -107,6 +110,7 @@ func (n *Node) syncSwarmPeer(swarm model.Swarm, trusted model.TrustedPeer) {
 		return
 	}
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(historyStreamTimeout))
 
 	localEntries, err := n.store.LoadTranscript(swarm.ID)
 	if err != nil {
@@ -128,6 +132,7 @@ func (n *Node) syncSwarmPeer(swarm model.Swarm, trusted model.TrustedPeer) {
 		return
 	}
 
+	response.Entries = clampWireTranscriptEntries(response.Entries)
 	remoteEntries := fromWireTranscriptEntries(response.Entries, n.host.ID().String())
 	added, err := n.store.MergeTranscript(swarm.ID, remoteEntries)
 	if err != nil || len(added) == 0 {
@@ -177,16 +182,23 @@ func diffTranscriptEntries(source, other []model.TranscriptEntry) []model.Transc
 }
 
 func toWireTranscriptEntries(entries []model.TranscriptEntry) []wireTranscriptEntry {
+	if len(entries) > store.TranscriptLimit {
+		entries = entries[len(entries)-store.TranscriptLimit:]
+	}
 	out := make([]wireTranscriptEntry, 0, len(entries))
 	for _, entry := range entries {
+		body, ok := sanitizeChatBody(entry.Body)
+		if entry.Kind == "chat" && !ok {
+			continue
+		}
 		out = append(out, wireTranscriptEntry{
 			ID:           entry.ID,
 			SwarmID:      entry.SwarmID,
 			Kind:         entry.Kind,
 			SenderPeerID: entry.SenderPeerID,
-			SenderName:   entry.SenderName,
-			Body:         entry.Body,
-			SentAt:       entry.SentAt,
+			SenderName:   sanitizeDisplayName(entry.SenderName),
+			Body:         body,
+			SentAt:       clampEventTime(entry.SentAt),
 		})
 	}
 	return out
@@ -198,16 +210,27 @@ func fromWireTranscriptEntries(entries []wireTranscriptEntry, localPeerID string
 		if strings.TrimSpace(entry.ID) == "" {
 			continue
 		}
+		body, ok := sanitizeChatBody(entry.Body)
+		if !ok && entry.Kind == "chat" {
+			continue
+		}
 		out = append(out, model.TranscriptEntry{
 			ID:           entry.ID,
 			SwarmID:      entry.SwarmID,
 			Kind:         entry.Kind,
 			SenderPeerID: entry.SenderPeerID,
-			SenderName:   entry.SenderName,
-			Body:         entry.Body,
-			SentAt:       entry.SentAt,
+			SenderName:   sanitizeDisplayName(entry.SenderName),
+			Body:         body,
+			SentAt:       clampEventTime(entry.SentAt),
 			Local:        entry.SenderPeerID == localPeerID,
 		})
 	}
 	return out
+}
+
+func clampWireTranscriptEntries(entries []wireTranscriptEntry) []wireTranscriptEntry {
+	if len(entries) > store.TranscriptLimit {
+		return entries[len(entries)-store.TranscriptLimit:]
+	}
+	return entries
 }

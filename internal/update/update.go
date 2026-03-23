@@ -3,9 +3,12 @@ package update
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -109,6 +112,13 @@ func (u *Updater) Update(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	checksumData, err := u.download(ctx, check.checksum.BrowserDownloadURL)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := verifyChecksum(check.asset.Name, archiveData, checksumData); err != nil {
+		return Result{}, err
+	}
 	binaryData, mode, err := extractBinary(check.asset.Name, archiveData, u.binaryFilename())
 	if err != nil {
 		return Result{}, err
@@ -130,34 +140,38 @@ func (u *Updater) Check(ctx context.Context) (Result, error) {
 	return check.result, nil
 }
 
-func (u *Updater) latestRelease(ctx context.Context) (githubRelease, githubAsset, error) {
+func (u *Updater) latestRelease(ctx context.Context) (githubRelease, githubAsset, githubAsset, error) {
 	var release githubRelease
 	url := strings.TrimRight(u.cfg.APIBaseURL, "/") + "/repos/" + u.cfg.RepoOwner + "/" + u.cfg.RepoName + "/releases/latest"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return release, githubAsset{}, fmt.Errorf("build release request: %w", err)
+		return release, githubAsset{}, githubAsset{}, fmt.Errorf("build release request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", userAgent(u.cfg.CurrentVersion))
 
 	resp, err := u.cfg.Client.Do(req)
 	if err != nil {
-		return release, githubAsset{}, fmt.Errorf("request latest release: %w", err)
+		return release, githubAsset{}, githubAsset{}, fmt.Errorf("request latest release: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return release, githubAsset{}, fmt.Errorf("request latest release: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return release, githubAsset{}, githubAsset{}, fmt.Errorf("request latest release: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return release, githubAsset{}, fmt.Errorf("decode latest release: %w", err)
+		return release, githubAsset{}, githubAsset{}, fmt.Errorf("decode latest release: %w", err)
 	}
 	asset, err := selectAsset(release, u.cfg.BinaryName, u.cfg.GOOS, u.cfg.GOARCH)
 	if err != nil {
-		return release, githubAsset{}, err
+		return release, githubAsset{}, githubAsset{}, err
 	}
-	return release, asset, nil
+	checksum, err := selectChecksumAsset(release)
+	if err != nil {
+		return release, githubAsset{}, githubAsset{}, err
+	}
+	return release, asset, checksum, nil
 }
 
 func (u *Updater) download(ctx context.Context, url string) ([]byte, error) {
@@ -210,12 +224,13 @@ func (u *Updater) targetExecutablePath() string {
 }
 
 type preparedUpdate struct {
-	result Result
-	asset  githubAsset
+	result   Result
+	asset    githubAsset
+	checksum githubAsset
 }
 
 func (u *Updater) prepareUpdate(ctx context.Context) (preparedUpdate, error) {
-	release, asset, err := u.latestRelease(ctx)
+	release, asset, checksum, err := u.latestRelease(ctx)
 	if err != nil {
 		return preparedUpdate{}, err
 	}
@@ -228,8 +243,9 @@ func (u *Updater) prepareUpdate(ctx context.Context) (preparedUpdate, error) {
 		Available:       shouldUpdate(u.cfg.CurrentVersion, release.TagName),
 	}
 	return preparedUpdate{
-		result: result,
-		asset:  asset,
+		result:   result,
+		asset:    asset,
+		checksum: checksum,
 	}, nil
 }
 
@@ -241,6 +257,15 @@ func selectAsset(release githubRelease, binaryName, goos, goarch string) (github
 		}
 	}
 	return githubAsset{}, fmt.Errorf("latest release %s does not contain %s", release.TagName, expectedName)
+}
+
+func selectChecksumAsset(release githubRelease) (githubAsset, error) {
+	for _, asset := range release.Assets {
+		if asset.Name == "checksums.txt" {
+			return asset, nil
+		}
+	}
+	return githubAsset{}, fmt.Errorf("latest release %s does not contain checksums.txt", release.TagName)
 }
 
 func assetName(binaryName, tag, goos, goarch string) string {
@@ -458,6 +483,34 @@ func userAgent(currentVersion string) string {
 		value = "dev"
 	}
 	return "yap/" + value
+}
+
+func verifyChecksum(assetName string, assetData, checksums []byte) error {
+	want := ""
+	scanner := bufio.NewScanner(bytes.NewReader(checksums))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "*")
+		if name == assetName {
+			want = strings.ToLower(fields[0])
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read checksums: %w", err)
+	}
+	if want == "" {
+		return fmt.Errorf("checksums.txt does not contain %s", assetName)
+	}
+	sum := sha256.Sum256(assetData)
+	got := hex.EncodeToString(sum[:])
+	if got != want {
+		return fmt.Errorf("checksum mismatch for %s", assetName)
+	}
+	return nil
 }
 
 func (u *Updater) binaryFilename() string {

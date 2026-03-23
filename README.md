@@ -128,7 +128,7 @@ Files:
 
 - `identity.json`: device identity and display name
 - `swarms/<id>.json`: room metadata and trusted peers
-- `transcripts/<id>.jsonl`: retained transcript, compacted to the most recent 1000 events and reconciled with trusted peers when they are online
+- `transcripts/<id>.jsonl`: retained transcript journal, reconciled with trusted peers when they are online, and compacted back to the most recent 1000 events
 
 All app-managed files are written with private permissions.
 

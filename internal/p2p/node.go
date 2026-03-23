@@ -28,21 +28,29 @@ import (
 )
 
 const (
-	mdnsServiceName    = "yap-v1"
-	cardProtocolID     = protocol.ID("/yap/card/1")
-	pairProtocolID     = protocol.ID("/yap/pair/1")
-	historyProtocolID  = protocol.ID("/yap/history/1")
-	heartbeatEvery     = 15 * time.Second
-	staleAfter         = 45 * time.Second
-	offlineAfter       = 90 * time.Second
-	reconnectEvery     = 20 * time.Second
-	historyCooldown    = 1 * time.Minute
-	inviteTTL          = 5 * time.Minute
-	defaultInviteUse   = 5
-	nearbyRefreshEvery = 10 * time.Second
-	nearbyRetryEvery   = 10 * time.Second
-	nearbyExpireAfter  = 30 * time.Second
-	nearbyCandidateTTL = 45 * time.Second
+	mdnsServiceName      = "yap-v2"
+	cardProtocolID       = protocol.ID("/yap/card/2")
+	pairProtocolID       = protocol.ID("/yap/pair/2")
+	historyProtocolID    = protocol.ID("/yap/history/2")
+	heartbeatEvery       = 15 * time.Second
+	staleAfter           = 45 * time.Second
+	offlineAfter         = 90 * time.Second
+	reconnectEvery       = 20 * time.Second
+	historyCooldown      = 1 * time.Minute
+	inviteTTL            = 5 * time.Minute
+	defaultInviteUse     = 5
+	nearbyRefreshEvery   = 10 * time.Second
+	nearbyRetryEvery     = 10 * time.Second
+	nearbyExpireAfter    = 30 * time.Second
+	nearbyCandidateTTL   = 45 * time.Second
+	cardStreamTimeout    = 5 * time.Second
+	pairStreamTimeout    = 2 * time.Minute
+	historyStreamTimeout = 15 * time.Second
+	maxDisplayNameBytes  = 64
+	maxChatBodyBytes     = 4096
+	maxPeerAddrs         = 16
+	maxSeenIDs           = 4096
+	maxClockSkew         = 5 * time.Minute
 )
 
 // EventKind is a UI-facing classification for node events.
@@ -108,6 +116,7 @@ type Node struct {
 	active           map[string]*activeSwarm
 	closed           bool
 	seen             map[string]struct{}
+	seenOrder        []string
 	historySync      map[string]time.Time
 }
 
@@ -163,10 +172,9 @@ type pairDecision struct {
 }
 
 type pairSuccess struct {
-	Stage string     `json:"stage"`
-	Swarm wireSwarm  `json:"swarm"`
-	Peer  wirePeer   `json:"peer"`
-	Seeds []wirePeer `json:"seeds,omitempty"`
+	Stage string    `json:"stage"`
+	Swarm wireSwarm `json:"swarm"`
+	Peer  wirePeer  `json:"peer"`
 }
 
 type wireSwarm struct {
@@ -176,13 +184,12 @@ type wireSwarm struct {
 }
 
 type envelope struct {
-	ID           string    `json:"id"`
-	Kind         string    `json:"kind"`
-	SenderPeerID string    `json:"sender_peer_id"`
-	SenderName   string    `json:"sender_name"`
-	SentAt       time.Time `json:"sent_at"`
-	Nonce        string    `json:"nonce"`
-	Ciphertext   string    `json:"ciphertext"`
+	ID         string    `json:"id"`
+	Kind       string    `json:"kind"`
+	SenderName string    `json:"sender_name"`
+	SentAt     time.Time `json:"sent_at"`
+	Nonce      string    `json:"nonce"`
+	Ciphertext string    `json:"ciphertext"`
 }
 
 type envelopeBody struct {
@@ -213,7 +220,13 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		return nil, fmt.Errorf("create host: %w", err)
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
+	ps, err := pubsub.NewGossipSub(
+		ctx,
+		h,
+		pubsub.WithMessageSignaturePolicy(pubsub.StrictSign),
+		pubsub.WithStrictSignatureVerification(true),
+		pubsub.WithMaxMessageSize(128<<10),
+	)
 	if err != nil {
 		h.Close()
 		cancel()
@@ -234,6 +247,7 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		pending:          make(map[string]chan bool),
 		active:           make(map[string]*activeSwarm),
 		seen:             make(map[string]struct{}),
+		seenOrder:        make([]string, 0, maxSeenIDs),
 		historySync:      make(map[string]time.Time),
 	}
 
@@ -311,6 +325,21 @@ func (n *Node) ResolveApproval(id string, accept bool) error {
 	ch <- accept
 	close(ch)
 	return nil
+}
+
+func (n *Node) registerPendingDecision() (string, chan bool, func()) {
+	id := mustID()
+	ch := make(chan bool, 1)
+	n.mu.Lock()
+	n.pending[id] = ch
+	n.mu.Unlock()
+	return id, ch, func() {
+		n.mu.Lock()
+		if current, ok := n.pending[id]; ok && current == ch {
+			delete(n.pending, id)
+		}
+		n.mu.Unlock()
+	}
 }
 
 // PairWithPeer starts a pairing flow with a discovered peer.
@@ -453,7 +482,7 @@ func (n *Node) PublishChat(swarmID, body string) error {
 	if err := n.publishEnvelope(active, env); err != nil {
 		return err
 	}
-	entry := transcriptEntryFromEnvelope(active.Swarm.ID, env, body, true)
+	entry := transcriptEntryFromEnvelope(active.Swarm.ID, n.host.ID().String(), env, body, true)
 	n.emit(Event{Kind: EventTranscript, Entry: &entry})
 	n.touchPresence(active, selfPresence(n.selfPeer()))
 	return nil
@@ -629,21 +658,30 @@ func (n *Node) fetchPeerCard(ctx context.Context, peerID peer.ID) (wirePeer, err
 		return wirePeer{}, fmt.Errorf("open card stream: %w", err)
 	}
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(cardStreamTimeout))
 
 	var card wirePeer
 	if err := json.NewDecoder(stream).Decode(&card); err != nil {
 		return wirePeer{}, fmt.Errorf("decode card: %w", err)
 	}
-	return card, nil
+	verified, err := verifiedTrustedPeer(stream.Conn(), card)
+	if err != nil {
+		return wirePeer{}, err
+	}
+	return toWirePeer(verified), nil
 }
 
 func (n *Node) handleCardStream(stream network.Stream) {
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(cardStreamTimeout))
 	_ = json.NewEncoder(stream).Encode(toWirePeer(n.selfPeer()))
 }
 
 func (n *Node) handlePairStream(stream network.Stream) {
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(pairStreamTimeout))
+	decisionCtx, cancel := context.WithTimeout(n.ctx, pairStreamTimeout)
+	defer cancel()
 
 	var request pairRequest
 	if err := json.NewDecoder(stream).Decode(&request); err != nil {
@@ -662,13 +700,14 @@ func (n *Node) handlePairStream(stream network.Stream) {
 		return
 	}
 
-	requester := fromWirePeer(request.Requester)
+	requester, err := verifiedTrustedPeer(stream.Conn(), request.Requester)
+	if err != nil {
+		_ = json.NewEncoder(stream).Encode(pairOffer{Stage: "rejected", Message: err.Error()})
+		return
+	}
 	requester.LastSeen = time.Now()
-	approvalID := mustID()
-	decision := make(chan bool, 1)
-	n.mu.Lock()
-	n.pending[approvalID] = decision
-	n.mu.Unlock()
+	approvalID, decision, cleanup := n.registerPendingDecision()
+	defer cleanup()
 	n.emit(Event{
 		Kind: EventApproval,
 		Approval: &Approval{
@@ -679,7 +718,7 @@ func (n *Node) handlePairStream(stream network.Stream) {
 		},
 	})
 
-	accepted, ok := waitForDecision(n.ctx, decision)
+	accepted, ok := waitForDecision(decisionCtx, decision)
 	if !ok || !accepted {
 		n.bumpInviteUse(invite.Invite.Code, false)
 		_ = json.NewEncoder(stream).Encode(pairOffer{Stage: "rejected", Message: "pairing rejected"})
@@ -713,15 +752,14 @@ func (n *Node) handlePairStream(stream network.Stream) {
 			Name:    invite.Swarm.Name,
 			RoomKey: invite.Swarm.RoomKey,
 		},
-		Peer:  toWirePeer(n.selfPeer()),
-		Seeds: trustedPeersToWire(invite.Swarm.TrustedPeers),
+		Peer: toWirePeer(n.selfPeer()),
 	}
 	if err := json.NewEncoder(stream).Encode(success); err != nil {
 		n.bumpInviteUse(invite.Invite.Code, false)
 		return
 	}
 
-	n.consumeInvite(invite.Invite.Code)
+	n.bumpInviteUse(invite.Invite.Code, true)
 	n.emit(Event{
 		Kind: EventPairComplete,
 		Pair: &PairResult{
@@ -733,7 +771,7 @@ func (n *Node) handlePairStream(stream network.Stream) {
 }
 
 func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
-	ctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(n.ctx, pairStreamTimeout)
 	defer cancel()
 
 	stream, err := n.host.NewStream(ctx, peerID, pairProtocolID)
@@ -742,6 +780,7 @@ func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
 		return
 	}
 	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(pairStreamTimeout))
 
 	request := pairRequest{
 		Code:      code,
@@ -766,12 +805,13 @@ func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
 		return
 	}
 
-	responder := fromWirePeer(offer.Responder)
-	approvalID := mustID()
-	decision := make(chan bool, 1)
-	n.mu.Lock()
-	n.pending[approvalID] = decision
-	n.mu.Unlock()
+	responder, err := verifiedTrustedPeer(stream.Conn(), offer.Responder)
+	if err != nil {
+		n.emitSystem(err.Error())
+		return
+	}
+	approvalID, decision, cleanup := n.registerPendingDecision()
+	defer cleanup()
 	n.emit(Event{
 		Kind: EventApproval,
 		Approval: &Approval{
@@ -782,7 +822,7 @@ func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
 		},
 	})
 
-	accepted, ok := waitForDecision(n.ctx, decision)
+	accepted, ok := waitForDecision(ctx, decision)
 	if !ok || !accepted {
 		_ = json.NewEncoder(stream).Encode(pairDecision{Accept: false})
 		return
@@ -801,15 +841,17 @@ func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
 		n.emitSystem("unexpected pairing completion")
 		return
 	}
-	swarm := model.Swarm{
-		ID:      success.Swarm.ID,
-		Name:    success.Swarm.Name,
-		RoomKey: success.Swarm.RoomKey,
+	verifiedPeer, err := verifiedTrustedPeer(stream.Conn(), success.Peer)
+	if err != nil {
+		n.emitSystem(err.Error())
+		return
 	}
-	swarm.TrustedPeers = append(swarm.TrustedPeers, fromWirePeer(success.Peer))
-	for _, seed := range success.Seeds {
-		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, fromWirePeer(seed))
+	swarm, err := validatedSwarm(success.Swarm)
+	if err != nil {
+		n.emitSystem(err.Error())
+		return
 	}
+	swarm.TrustedPeers = append(swarm.TrustedPeers, verifiedPeer)
 	n.emit(Event{
 		Kind: EventPairComplete,
 		Pair: &PairResult{
@@ -834,6 +876,10 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 		if n.markSeen(env.ID) {
 			continue
 		}
+		author := msg.GetFrom()
+		if author == "" {
+			continue
+		}
 		bodyBytes, err := yapcrypto.Decrypt(active.Swarm.RoomKey, env.Nonce, env.Ciphertext)
 		if err != nil {
 			continue
@@ -842,34 +888,43 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
 			continue
 		}
+		sentAt := clampEventTime(env.SentAt)
+		senderPeerID := author.String()
+		senderName := resolvedPeerName(active.Swarm, author, env.SenderName)
+		senderFingerprint := n.peerFingerprint(author)
 
 		switch env.Kind {
 		case "chat":
+			body, ok := sanitizeChatBody(payload.Body)
+			if !ok {
+				continue
+			}
 			entry := model.TranscriptEntry{
 				ID:           env.ID,
 				SwarmID:      active.Swarm.ID,
 				Kind:         "chat",
-				SenderPeerID: env.SenderPeerID,
-				SenderName:   env.SenderName,
-				Body:         payload.Body,
-				SentAt:       env.SentAt,
+				SenderPeerID: senderPeerID,
+				SenderName:   senderName,
+				Body:         body,
+				SentAt:       sentAt,
 			}
 			n.emit(Event{Kind: EventTranscript, Entry: &entry})
 			n.touchPresence(active, presenceRecord{
-				PeerID:   env.SenderPeerID,
-				Name:     env.SenderName,
-				State:    "online",
-				LastSeen: env.SentAt,
+				PeerID:      senderPeerID,
+				Name:        senderName,
+				Fingerprint: senderFingerprint,
+				State:       "online",
+				LastSeen:    sentAt,
 			})
 		case "join", "leave":
 			entry := model.TranscriptEntry{
 				ID:           env.ID,
 				SwarmID:      active.Swarm.ID,
 				Kind:         env.Kind,
-				SenderPeerID: env.SenderPeerID,
-				SenderName:   env.SenderName,
+				SenderPeerID: senderPeerID,
+				SenderName:   senderName,
 				Body:         payload.Body,
-				SentAt:       env.SentAt,
+				SentAt:       sentAt,
 			}
 			n.emit(Event{Kind: EventTranscript, Entry: &entry})
 			state := "online"
@@ -877,17 +932,19 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				state = "offline"
 			}
 			n.touchPresence(active, presenceRecord{
-				PeerID:   env.SenderPeerID,
-				Name:     env.SenderName,
-				State:    state,
-				LastSeen: env.SentAt,
+				PeerID:      senderPeerID,
+				Name:        senderName,
+				Fingerprint: senderFingerprint,
+				State:       state,
+				LastSeen:    sentAt,
 			})
 		case "heartbeat":
 			n.touchPresence(active, presenceRecord{
-				PeerID:   env.SenderPeerID,
-				Name:     env.SenderName,
-				State:    "online",
-				LastSeen: env.SentAt,
+				PeerID:      senderPeerID,
+				Name:        senderName,
+				Fingerprint: senderFingerprint,
+				State:       "online",
+				LastSeen:    sentAt,
 			})
 		}
 	}
@@ -944,6 +1001,13 @@ func (n *Node) publishKind(active *activeSwarm, kind, body string) error {
 }
 
 func (n *Node) newEnvelope(active *activeSwarm, kind, body, id string, sentAt time.Time) (envelope, error) {
+	if kind == "chat" {
+		var ok bool
+		body, ok = sanitizeChatBody(body)
+		if !ok {
+			return envelope{}, fmt.Errorf("chat body exceeds %d bytes", maxChatBodyBytes)
+		}
+	}
 	payloadBytes, err := json.Marshal(envelopeBody{Body: body})
 	if err != nil {
 		return envelope{}, fmt.Errorf("encode payload: %w", err)
@@ -959,13 +1023,12 @@ func (n *Node) newEnvelope(active *activeSwarm, kind, body, id string, sentAt ti
 		sentAt = time.Now()
 	}
 	return envelope{
-		ID:           id,
-		Kind:         kind,
-		SenderPeerID: n.host.ID().String(),
-		SenderName:   n.identity.Name,
-		SentAt:       sentAt,
-		Nonce:        nonce,
-		Ciphertext:   ciphertext,
+		ID:         id,
+		Kind:       kind,
+		SenderName: sanitizeDisplayName(n.identity.Name),
+		SentAt:     sentAt,
+		Nonce:      nonce,
+		Ciphertext: ciphertext,
 	}, nil
 }
 
@@ -981,12 +1044,12 @@ func (n *Node) publishEnvelope(active *activeSwarm, env envelope) error {
 	return nil
 }
 
-func transcriptEntryFromEnvelope(swarmID string, env envelope, body string, local bool) model.TranscriptEntry {
+func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelope, body string, local bool) model.TranscriptEntry {
 	return model.TranscriptEntry{
 		ID:           env.ID,
 		SwarmID:      swarmID,
 		Kind:         env.Kind,
-		SenderPeerID: env.SenderPeerID,
+		SenderPeerID: senderPeerID,
 		SenderName:   env.SenderName,
 		Body:         body,
 		SentAt:       env.SentAt,
@@ -1028,6 +1091,7 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 	n.mu.Lock()
 	record, ok := active.Presence[update.PeerID]
 	previousState := ""
+	changed := false
 	if !ok {
 		record = &presenceRecord{
 			PeerID:      update.PeerID,
@@ -1035,24 +1099,32 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 			Fingerprint: update.Fingerprint,
 		}
 		active.Presence[update.PeerID] = record
+		changed = true
 	} else {
 		previousState = record.State
 	}
-	if update.Name != "" {
+	if update.Name != "" && update.Name != record.Name {
 		record.Name = update.Name
+		changed = true
 	}
-	if update.Fingerprint != "" {
+	if update.Fingerprint != "" && update.Fingerprint != record.Fingerprint {
 		record.Fingerprint = update.Fingerprint
+		changed = true
 	}
-	if !update.LastSeen.IsZero() {
+	if !update.LastSeen.IsZero() && !update.LastSeen.Equal(record.LastSeen) {
 		record.LastSeen = update.LastSeen
+		changed = true
 	}
-	if update.State != "" {
+	if update.State != "" && update.State != record.State {
 		record.State = update.State
+		changed = true
 	}
 	n.mu.Unlock()
+	if !changed {
+		return
+	}
 	n.emitPresenceSnapshot(active)
-	if update.PeerID != n.host.ID().String() && update.State == "online" && previousState != "online" {
+	if update.PeerID != n.host.ID().String() && record.State == "online" && previousState != "online" {
 		go n.syncSwarm(active)
 	}
 }
@@ -1060,28 +1132,41 @@ func (n *Node) touchPresence(active *activeSwarm, update presenceRecord) {
 func (n *Node) refreshPresence(active *activeSwarm) {
 	n.mu.Lock()
 	now := time.Now()
+	changed := false
 	for _, record := range active.Presence {
 		if record.PeerID == n.host.ID().String() {
-			record.State = "online"
-			record.LastSeen = now
+			if record.State != "online" {
+				record.State = "online"
+				changed = true
+			}
 			continue
 		}
+		nextState := "offline"
 		if record.LastSeen.IsZero() {
-			record.State = "offline"
+			if record.State != nextState {
+				record.State = nextState
+				changed = true
+			}
 			continue
 		}
 		age := now.Sub(record.LastSeen)
 		switch {
 		case age >= offlineAfter:
-			record.State = "offline"
+			nextState = "offline"
 		case age >= staleAfter:
-			record.State = "stale"
+			nextState = "stale"
 		default:
-			record.State = "online"
+			nextState = "online"
+		}
+		if record.State != nextState {
+			record.State = nextState
+			changed = true
 		}
 	}
 	n.mu.Unlock()
-	n.emitPresenceSnapshot(active)
+	if changed {
+		n.emitPresenceSnapshot(active)
+	}
 }
 
 func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
@@ -1132,6 +1217,15 @@ func (n *Node) currentSwarm(swarmID string) *activeSwarm {
 }
 
 func (n *Node) emit(event Event) {
+	switch event.Kind {
+	case EventNearbySnapshot, EventPresence, EventSystem:
+		select {
+		case n.events <- event:
+		case <-n.ctx.Done():
+		default:
+		}
+		return
+	}
 	select {
 	case n.events <- event:
 	case <-n.ctx.Done():
@@ -1161,9 +1255,9 @@ func (n *Node) emitNearbySnapshot() {
 func (n *Node) selfPeer() model.TrustedPeer {
 	return model.TrustedPeer{
 		PeerID:      n.host.ID().String(),
-		Name:        n.identity.Name,
+		Name:        sanitizeDisplayName(n.identity.Name),
 		Fingerprint: n.identity.Fingerprint,
-		Addrs:       multiaddrStrings(n.host.Addrs()),
+		Addrs:       sanitizePeerAddrs(multiaddrStrings(n.host.Addrs())),
 		LastSeen:    time.Now(),
 	}
 }
@@ -1178,12 +1272,6 @@ func (n *Node) lookupInvite(code string) (*activeInvite, bool) {
 	return invite, true
 }
 
-func (n *Node) consumeInvite(code string) {
-	n.mu.Lock()
-	delete(n.invites, code)
-	n.mu.Unlock()
-}
-
 func (n *Node) bumpInviteUse(code string, success bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1191,8 +1279,10 @@ func (n *Node) bumpInviteUse(code string, success bool) {
 	if !ok {
 		return
 	}
-	invite.Invite.CurrentUse++
-	if success || invite.Invite.CurrentUse >= invite.Invite.MaxUses || time.Now().After(invite.Invite.ExpiresAt) {
+	if success {
+		invite.Invite.CurrentUse++
+	}
+	if invite.Invite.CurrentUse >= invite.Invite.MaxUses || time.Now().After(invite.Invite.ExpiresAt) {
 		delete(n.invites, code)
 	}
 }
@@ -1218,14 +1308,20 @@ func (n *Node) inviteJanitor() {
 }
 
 func (n *Node) markSeen(id string) bool {
+	if strings.TrimSpace(id) == "" {
+		return false
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if _, ok := n.seen[id]; ok {
 		return true
 	}
 	n.seen[id] = struct{}{}
-	if len(n.seen) > 4096 {
-		n.seen = make(map[string]struct{})
+	n.seenOrder = append(n.seenOrder, id)
+	if len(n.seenOrder) > maxSeenIDs {
+		evicted := n.seenOrder[0]
+		n.seenOrder = n.seenOrder[1:]
+		delete(n.seen, evicted)
 	}
 	return false
 }
@@ -1239,30 +1335,78 @@ func waitForDecision(ctx context.Context, ch <-chan bool) (bool, bool) {
 	}
 }
 
+func validatedSwarm(raw wireSwarm) (model.Swarm, error) {
+	swarm := model.Swarm{
+		ID:      strings.TrimSpace(raw.ID),
+		Name:    sanitizeDisplayName(raw.Name),
+		RoomKey: strings.TrimSpace(raw.RoomKey),
+	}
+	if swarm.ID == "" {
+		return model.Swarm{}, fmt.Errorf("invalid swarm id")
+	}
+	if swarm.Name == "" {
+		return model.Swarm{}, fmt.Errorf("invalid swarm name")
+	}
+	if swarm.RoomKey == "" {
+		return model.Swarm{}, fmt.Errorf("invalid room key")
+	}
+	if _, _, err := yapcrypto.Encrypt(swarm.RoomKey, []byte("{}")); err != nil {
+		return model.Swarm{}, fmt.Errorf("invalid room key")
+	}
+	return swarm, nil
+}
+
+func verifiedTrustedPeer(conn network.Conn, claimed wirePeer) (model.TrustedPeer, error) {
+	if conn == nil {
+		return model.TrustedPeer{}, fmt.Errorf("missing authenticated connection")
+	}
+	addrs := sanitizePeerAddrs(claimed.Addrs)
+	if remoteAddr := conn.RemoteMultiaddr(); remoteAddr != nil {
+		addrs = uniqueStrings(append(addrs, remoteAddr.String()))
+	}
+	return verifiedClaimedPeer(conn.RemotePeer(), conn.RemotePublicKey(), addrs, claimed)
+}
+
+func verifiedClaimedPeer(remotePeer peer.ID, remoteKey corecrypto.PubKey, observedAddrs []string, claimed wirePeer) (model.TrustedPeer, error) {
+	if remotePeer == "" {
+		return model.TrustedPeer{}, fmt.Errorf("missing authenticated peer id")
+	}
+	if remoteKey == nil {
+		return model.TrustedPeer{}, fmt.Errorf("missing authenticated peer key")
+	}
+	derivedPeerID, err := peer.IDFromPublicKey(remoteKey)
+	if err != nil {
+		return model.TrustedPeer{}, fmt.Errorf("derive authenticated peer id: %w", err)
+	}
+	if derivedPeerID != remotePeer {
+		return model.TrustedPeer{}, fmt.Errorf("authenticated peer id mismatch")
+	}
+	publicKeyBytes, err := corecrypto.MarshalPublicKey(remoteKey)
+	if err != nil {
+		return model.TrustedPeer{}, fmt.Errorf("marshal authenticated peer key: %w", err)
+	}
+	fingerprint := yapcrypto.Fingerprint(publicKeyBytes)
+	if claimedPeerID := strings.TrimSpace(claimed.PeerID); claimedPeerID != "" && claimedPeerID != remotePeer.String() {
+		return model.TrustedPeer{}, fmt.Errorf("claimed peer id does not match authenticated peer")
+	}
+	if claimedFingerprint := strings.TrimSpace(claimed.Fingerprint); claimedFingerprint != "" && !strings.EqualFold(claimedFingerprint, fingerprint) {
+		return model.TrustedPeer{}, fmt.Errorf("claimed fingerprint does not match authenticated peer")
+	}
+	return model.TrustedPeer{
+		PeerID:      remotePeer.String(),
+		Name:        sanitizeDisplayName(claimed.Name),
+		Fingerprint: fingerprint,
+		Addrs:       sanitizePeerAddrs(observedAddrs),
+	}, nil
+}
+
 func toWirePeer(peerInfo model.TrustedPeer) wirePeer {
 	return wirePeer{
 		PeerID:      peerInfo.PeerID,
-		Name:        peerInfo.Name,
+		Name:        sanitizeDisplayName(peerInfo.Name),
 		Fingerprint: peerInfo.Fingerprint,
-		Addrs:       append([]string(nil), peerInfo.Addrs...),
+		Addrs:       sanitizePeerAddrs(peerInfo.Addrs),
 	}
-}
-
-func fromWirePeer(card wirePeer) model.TrustedPeer {
-	return model.TrustedPeer{
-		PeerID:      card.PeerID,
-		Name:        card.Name,
-		Fingerprint: card.Fingerprint,
-		Addrs:       append([]string(nil), card.Addrs...),
-	}
-}
-
-func trustedPeersToWire(peers []model.TrustedPeer) []wirePeer {
-	out := make([]wirePeer, 0, len(peers))
-	for _, peerInfo := range peers {
-		out = append(out, toWirePeer(peerInfo))
-	}
-	return out
 }
 
 func mergeTrustedPeer(peers []model.TrustedPeer, peerInfo model.TrustedPeer) []model.TrustedPeer {
@@ -1361,7 +1505,7 @@ func nearbyLabel(peerInfo model.NearbyPeer) string {
 }
 
 func topicName(swarmID string) string {
-	return "yap/swarm/" + swarmID + "/v1"
+	return "yap/swarm/" + swarmID + "/v2"
 }
 
 func listenAddrs() []string {
@@ -1424,6 +1568,73 @@ func selfPresence(self model.TrustedPeer) presenceRecord {
 		State:       "online",
 		LastSeen:    time.Now(),
 	}
+}
+
+func sanitizeDisplayName(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	runes := []rune(value)
+	if len(runes) > maxDisplayNameBytes {
+		value = string(runes[:maxDisplayNameBytes])
+	}
+	return value
+}
+
+func sanitizePeerAddrs(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range uniqueStrings(values) {
+		if len(out) >= maxPeerAddrs {
+			break
+		}
+		if _, err := ma.NewMultiaddr(value); err != nil {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func sanitizeChatBody(body string) (string, bool) {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	if len(body) > maxChatBodyBytes {
+		return "", false
+	}
+	return body, true
+}
+
+func clampEventTime(sentAt time.Time) time.Time {
+	now := time.Now()
+	if sentAt.IsZero() {
+		return now
+	}
+	if sentAt.After(now.Add(maxClockSkew)) || sentAt.Before(now.Add(-maxClockSkew)) {
+		return now
+	}
+	return sentAt
+}
+
+func resolvedPeerName(swarm model.Swarm, author peer.ID, claimed string) string {
+	if name := sanitizeDisplayName(claimed); name != "" {
+		return name
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID == author.String() && strings.TrimSpace(trusted.Name) != "" {
+			return trusted.Name
+		}
+	}
+	return author.String()
+}
+
+func (n *Node) peerFingerprint(author peer.ID) string {
+	if author == "" {
+		return ""
+	}
+	if key := n.host.Peerstore().PubKey(author); key != nil {
+		publicKeyBytes, err := corecrypto.MarshalPublicKey(key)
+		if err == nil {
+			return yapcrypto.Fingerprint(publicKeyBytes)
+		}
+	}
+	return ""
 }
 
 type discoveryNotifee struct {

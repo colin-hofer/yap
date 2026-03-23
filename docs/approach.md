@@ -5,7 +5,7 @@
 The rewrite replaces the earlier custom UDP gossip design with libp2p:
 
 - peer identity: persisted Ed25519 keypair
-- local discovery: mDNS service name `yap-v1`
+- local discovery: mDNS service name `yap-v2`
 - transport: libp2p host with default secure channels; current runtime defaults to TCP listeners, with QUIC kept as an experimental opt-in
 - group messaging: GossipSub topic per swarm
 
@@ -23,7 +23,7 @@ Pairing is intentionally manual on both sides so users can compare the presented
 
 ## Pairing Protocol
 
-Pairing runs over `/yap/pair/1`.
+Pairing runs over `/yap/pair/2`.
 
 1. Invitee discovers the inviter on the LAN and opens a pair stream.
 2. Invitee sends the invite code plus its identity card.
@@ -62,4 +62,4 @@ The UI only talks to the `internal/app` service. It never mutates persistence or
 - swarms are saved independently and can be reopened later
 - transcripts are retained locally and reconciled with trusted peers when they are online
 - metadata writes are atomic
-- transcript compaction keeps the last 1000 events
+- transcript retention keeps the last 1000 events, with append-first writes and periodic compaction

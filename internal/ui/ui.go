@@ -197,6 +197,9 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.syncLayout()
+		if m.mode == "chat" {
+			m.syncTranscript(false)
+		}
 		return m, nil
 	case tea.KeyboardEnhancementsMsg:
 		m.keyDisambiguation = msg.SupportsKeyDisambiguation()
@@ -597,6 +600,7 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		if event.Snapshot.Version < m.state.Version {
 			return nil
 		}
+		prevState := m.state
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
@@ -622,13 +626,20 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			m.transcriptIdx = 0
 		}
 		m.syncLayout()
+		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
+			m.syncTranscript(false)
+		}
 		return nil
 	case app.EventToast:
+		prevState := m.state
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
 		m.status = event.Message
 		m.syncLayout()
+		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
+			m.syncTranscript(false)
+		}
 		return nil
 	case app.EventInvite:
 		if event.Snapshot.Version < m.state.Version {
@@ -692,7 +703,6 @@ func (m *modelUI) syncLayout() {
 		m.messages.SetWidth(chatWidth - 6)
 		m.messages.SetHeight(msgHeight)
 		m.composer.SetWidth(chatWidth - 6)
-		m.syncTranscript(false)
 	}
 }
 
@@ -900,28 +910,49 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 	if width <= 0 {
 		width = 70
 	}
-	var lines []string
 	if len(entries) == 0 {
-		lines = append(lines, mutedStyle.Render("No messages yet."))
+		return mutedStyle.Render("No messages yet.")
 	}
+	var b strings.Builder
+	prevSender := ""
+	prevKind := ""
+	first := true
 	for i, entry := range entries {
+		if entry.Kind != "chat" && entry.Kind != "join" && entry.Kind != "leave" {
+			if strings.TrimSpace(entry.Body) == "" {
+				continue
+			}
+		}
+
+		// Consecutive chat messages from the same sender get collapsed.
+		sameSender := entry.Kind == "chat" && prevKind == "chat" && entry.SenderPeerID == prevSender
+
+		if !first {
+			if sameSender {
+				b.WriteByte('\n')
+			} else {
+				b.WriteString("\n\n")
+			}
+		}
+
 		selected := i == m.transcriptIdx && m.focus == "transcript"
 		var block string
 		if selected {
-			block = selectedStyle.Render(renderTranscriptEntryPlain(entry))
+			block = selectedStyle.Render(renderTranscriptEntryPlain(entry, sameSender))
 		} else {
-			block = renderTranscriptEntry(entry)
+			block = renderTranscriptEntry(entry, sameSender)
 		}
-		switch entry.Kind {
-		case "chat", "join", "leave":
-			lines = append(lines, block)
-		default:
-			if strings.TrimSpace(entry.Body) != "" {
-				lines = append(lines, block)
-			}
+		b.WriteString(block)
+
+		if entry.Kind == "chat" {
+			prevSender = entry.SenderPeerID
+		} else {
+			prevSender = ""
 		}
+		prevKind = entry.Kind
+		first = false
 	}
-	return strings.Join(lines, "\n\n")
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -990,22 +1021,25 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 	return &peerInfo
 }
 
-func renderChatEntry(entry model.TranscriptEntry) string {
-	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
-	sep := mutedStyle.Render(" · ")
+func renderChatEntry(entry model.TranscriptEntry, continuation bool) string {
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
 		nameStyle = lipgloss.NewStyle().Foreground(colorSelf).Bold(true)
 		bodyStyle = lipgloss.NewStyle().Foreground(colorSelf)
 	}
+	if continuation {
+		return bodyStyle.Render(entry.Body)
+	}
+	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
+	sep := mutedStyle.Render(" · ")
 	return ts + sep + nameStyle.Render(entry.SenderName) + "\n" + bodyStyle.Render(entry.Body)
 }
 
-func renderTranscriptEntry(entry model.TranscriptEntry) string {
+func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool) string {
 	switch entry.Kind {
 	case "chat":
-		return renderChatEntry(entry)
+		return renderChatEntry(entry, continuation)
 	case "join":
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("→ " + entry.SenderName + " joined")
 	case "leave":
@@ -1018,9 +1052,12 @@ func renderTranscriptEntry(entry model.TranscriptEntry) string {
 	}
 }
 
-func renderTranscriptEntryPlain(entry model.TranscriptEntry) string {
+func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool) string {
 	switch entry.Kind {
 	case "chat":
+		if continuation {
+			return entry.Body
+		}
 		return entry.SentAt.Format("15:04") + " · " + entry.SenderName + "\n" + entry.Body
 	case "join":
 		return "→ " + entry.SenderName + " joined"
@@ -1119,6 +1156,32 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:10]
+}
+
+func selectedSwarmID(state app.State) string {
+	if state.SelectedSwarm == nil {
+		return ""
+	}
+	return state.SelectedSwarm.ID
+}
+
+func sameTranscriptEntries(left, right []model.TranscriptEntry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].ID != right[i].ID ||
+			left[i].SwarmID != right[i].SwarmID ||
+			left[i].Kind != right[i].Kind ||
+			left[i].SenderPeerID != right[i].SenderPeerID ||
+			left[i].SenderName != right[i].SenderName ||
+			left[i].Body != right[i].Body ||
+			!left[i].SentAt.Equal(right[i].SentAt) ||
+			left[i].Local != right[i].Local {
+			return false
+		}
+	}
+	return true
 }
 
 func displayVersion(value string) string {

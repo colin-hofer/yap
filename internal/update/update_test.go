@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"os"
@@ -17,12 +19,15 @@ func TestUpdaterReplacesExecutableFromTarGz(t *testing.T) {
 	t.Parallel()
 
 	archiveData := tarGzArchive(t, "yap", []byte("new-binary"))
+	checksums := checksumFile("yap_0.2.0_linux_amd64.tar.gz", archiveData)
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/repos/acme/yap/releases/latest":
-			return jsonResponse(`{"tag_name":"v0.2.0","html_url":"https://example.invalid/release","assets":[{"name":"yap_0.2.0_linux_amd64.tar.gz","browser_download_url":"https://api.example.test/downloads/yap_0.2.0_linux_amd64.tar.gz"}]}`), nil
+			return jsonResponse(releaseJSON()), nil
 		case "/downloads/yap_0.2.0_linux_amd64.tar.gz":
 			return binaryResponse(archiveData), nil
+		case "/downloads/checksums.txt":
+			return binaryResponse(checksums), nil
 		default:
 			return notFoundResponse(), nil
 		}
@@ -88,8 +93,11 @@ func TestUpdaterSkipsDownloadWhenAlreadyCurrent(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/repos/acme/yap/releases/latest":
-			return jsonResponse(`{"tag_name":"v0.2.0","html_url":"https://example.invalid/release","assets":[{"name":"yap_0.2.0_linux_amd64.tar.gz","browser_download_url":"https://api.example.test/downloads/yap_0.2.0_linux_amd64.tar.gz"}]}`), nil
+			return jsonResponse(releaseJSON()), nil
 		case "/downloads/yap_0.2.0_linux_amd64.tar.gz":
+			downloads++
+			return response(http.StatusInternalServerError, []byte("should not download")), nil
+		case "/downloads/checksums.txt":
 			downloads++
 			return response(http.StatusInternalServerError, []byte("should not download")), nil
 		default:
@@ -162,8 +170,11 @@ func TestUpdaterCheckReportsAvailableUpdateWithoutInstalling(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch r.URL.Path {
 		case "/repos/acme/yap/releases/latest":
-			return jsonResponse(`{"tag_name":"v0.2.0","html_url":"https://example.invalid/release","assets":[{"name":"yap_0.2.0_linux_amd64.tar.gz","browser_download_url":"https://api.example.test/downloads/yap_0.2.0_linux_amd64.tar.gz"}]}`), nil
+			return jsonResponse(releaseJSON()), nil
 		case "/downloads/yap_0.2.0_linux_amd64.tar.gz":
+			downloads++
+			return response(http.StatusInternalServerError, []byte("should not download")), nil
+		case "/downloads/checksums.txt":
 			downloads++
 			return response(http.StatusInternalServerError, []byte("should not download")), nil
 		default:
@@ -219,6 +230,15 @@ func TestExtractZIPBinaryRejectsOversizedBinary(t *testing.T) {
 	}
 }
 
+func TestVerifyChecksumRejectsMismatch(t *testing.T) {
+	t.Parallel()
+
+	err := verifyChecksum("asset.tar.gz", []byte("actual"), []byte("deadbeef  asset.tar.gz\n"))
+	if err == nil {
+		t.Fatalf("expected checksum mismatch")
+	}
+}
+
 func tarGzArchive(t *testing.T, name string, contents []byte) []byte {
 	t.Helper()
 
@@ -264,6 +284,15 @@ func zipArchive(t *testing.T, name string, contents []byte) []byte {
 		t.Fatalf("close zip writer: %v", err)
 	}
 	return buffer.Bytes()
+}
+
+func releaseJSON() string {
+	return `{"tag_name":"v0.2.0","html_url":"https://example.invalid/release","assets":[{"name":"yap_0.2.0_linux_amd64.tar.gz","browser_download_url":"https://api.example.test/downloads/yap_0.2.0_linux_amd64.tar.gz"},{"name":"checksums.txt","browser_download_url":"https://api.example.test/downloads/checksums.txt"}]}`
+}
+
+func checksumFile(name string, body []byte) []byte {
+	sum := sha256.Sum256(body)
+	return []byte(hex.EncodeToString(sum[:]) + "  " + name + "\n")
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

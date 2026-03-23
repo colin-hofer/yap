@@ -72,17 +72,18 @@ type Service struct {
 	store *store.Store
 	node  *p2p.Node
 
-	mu           sync.RWMutex
-	identity     model.Identity
-	swarms       []model.Swarm
-	nearby       map[string]model.NearbyPeer
-	selectedID   string
-	transcripts  map[string][]model.TranscriptEntry
-	presence     map[string][]model.Presence
-	unread       map[string]int
-	connected    map[string]bool
-	lastActivity map[string]time.Time
-	version      uint64
+	mu            sync.RWMutex
+	identity      model.Identity
+	swarms        []model.Swarm
+	nearby        map[string]model.NearbyPeer
+	selectedID    string
+	transcripts   map[string][]model.TranscriptEntry
+	transcriptLag map[string]int
+	presence      map[string][]model.Presence
+	unread        map[string]int
+	connected     map[string]bool
+	lastActivity  map[string]time.Time
+	version       uint64
 
 	events chan Event
 
@@ -133,6 +134,7 @@ func New(parent context.Context, opts Options) (*Service, error) {
 		swarms:        swarms,
 		nearby:        make(map[string]model.NearbyPeer),
 		transcripts:   make(map[string][]model.TranscriptEntry),
+		transcriptLag: make(map[string]int),
 		presence:      make(map[string][]model.Presence),
 		unread:        make(map[string]int),
 		connected:     make(map[string]bool),
@@ -227,6 +229,7 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 	}
 	s.mu.Lock()
 	s.transcripts[swarm.ID] = nil
+	s.transcriptLag[swarm.ID] = 0
 	s.lastActivity[swarm.ID] = swarm.LastOpened
 	if err := s.reloadSwarmsLocked(); err != nil {
 		s.mu.Unlock()
@@ -239,7 +242,7 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 
 // RenameIdentity updates the local display name and persists it.
 func (s *Service) RenameIdentity(name string) error {
-	name = strings.TrimSpace(name)
+	name = normalizeIdentityName(name)
 	if name == "" {
 		return fmt.Errorf("name cannot be empty")
 	}
@@ -343,6 +346,7 @@ func (s *Service) RemoveSwarm(ref string) error {
 
 	s.mu.Lock()
 	delete(s.transcripts, swarm.ID)
+	delete(s.transcriptLag, swarm.ID)
 	delete(s.presence, swarm.ID)
 	delete(s.unread, swarm.ID)
 	delete(s.connected, swarm.ID)
@@ -458,10 +462,24 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 
 func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist bool) {
 	s.mu.Lock()
+	if s.transcriptLag == nil {
+		s.transcriptLag = make(map[string]int)
+	}
 	merged, added := mergeTranscriptEntries(s.transcripts[entry.SwarmID], []model.TranscriptEntry{entry})
 	s.transcripts[entry.SwarmID] = merged
+	shouldCompact := false
 	if len(added) > 0 {
 		s.lastActivity[entry.SwarmID] = activityTimeForEntries(s.lastActivity[entry.SwarmID], added)
+		if len(merged) >= store.TranscriptLimit {
+			nextLag := s.transcriptLag[entry.SwarmID] + 1
+			if nextLag >= 64 {
+				shouldCompact = true
+				nextLag = 0
+			}
+			s.transcriptLag[entry.SwarmID] = nextLag
+		} else {
+			s.transcriptLag[entry.SwarmID] = 0
+		}
 	}
 	selected := s.selectedID == entry.SwarmID
 	swarmName := s.swarmNameLocked(entry.SwarmID)
@@ -470,8 +488,14 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 	}
 	s.mu.Unlock()
 
-	if persist {
-		if err := s.store.AppendTranscript(entry.SwarmID, entry); err != nil {
+	if persist && len(added) > 0 {
+		var err error
+		if shouldCompact {
+			err = s.store.ReplaceTranscript(entry.SwarmID, merged)
+		} else {
+			err = s.store.AppendTranscript(entry.SwarmID, entry)
+		}
+		if err != nil {
 			s.emitToast(err.Error())
 		}
 	}
@@ -487,12 +511,16 @@ func (s *Service) handleHistoryImport(swarmID string, entries []model.Transcript
 		return
 	}
 	s.mu.Lock()
+	if s.transcriptLag == nil {
+		s.transcriptLag = make(map[string]int)
+	}
 	merged, added := mergeTranscriptEntries(s.transcripts[swarmID], entries)
 	if len(added) == 0 {
 		s.mu.Unlock()
 		return
 	}
 	s.transcripts[swarmID] = merged
+	s.transcriptLag[swarmID] = 0
 	s.lastActivity[swarmID] = activityTimeForEntries(s.lastActivity[swarmID], added)
 	if s.selectedID != swarmID {
 		s.unread[swarmID] += countChatEntries(added)
@@ -522,7 +550,6 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 			PeerID:      item.PeerID,
 			Name:        item.Name,
 			Fingerprint: item.Fingerprint,
-			LastSeen:    item.LastSeen,
 		}
 		next := mergeTrustedPeer(swarm.TrustedPeers, peerInfo)
 		if !trustedPeersEqual(swarm.TrustedPeers, next) {
@@ -577,9 +604,13 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		}
 
 		s.mu.Lock()
+		if s.transcriptLag == nil {
+			s.transcriptLag = make(map[string]int)
+		}
 		if _, ok := s.transcripts[swarm.ID]; !ok {
 			s.transcripts[swarm.ID] = nil
 		}
+		s.transcriptLag[swarm.ID] = 0
 		s.lastActivity[swarm.ID] = swarm.LastOpened
 		s.connected[swarm.ID] = true
 		_ = s.reloadSwarmsLocked()
@@ -847,6 +878,15 @@ func displayNearbyName(peerInfo model.NearbyPeer) string {
 	return peerInfo.PeerID
 }
 
+func normalizeIdentityName(value string) string {
+	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	runes := []rune(value)
+	if len(runes) > 64 {
+		value = string(runes[:64])
+	}
+	return value
+}
+
 func activityTime(swarm model.Swarm, transcript []model.TranscriptEntry) time.Time {
 	last := swarm.LastOpened
 	for _, entry := range transcript {
@@ -892,8 +932,8 @@ func mergeTranscriptEntries(existing, incoming []model.TranscriptEntry) ([]model
 		}
 		return merged[i].SentAt.Before(merged[j].SentAt)
 	})
-	if len(merged) > 1000 {
-		merged = merged[len(merged)-1000:]
+	if len(merged) > store.TranscriptLimit {
+		merged = merged[len(merged)-store.TranscriptLimit:]
 	}
 	retained := make(map[string]struct{}, len(merged))
 	for _, entry := range merged {
