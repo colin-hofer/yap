@@ -83,6 +83,7 @@ type modelUI struct {
 	swarmIdx      int
 	nearbyIdx     int
 	transcriptIdx int
+	transcriptSel transcriptSelection
 	status        string
 	replyTo       *model.TranscriptEntry
 
@@ -115,6 +116,17 @@ type copyResultMsg struct {
 	Message string
 }
 
+type transcriptSelection struct {
+	StartLine int
+	EndLine   int
+}
+
+type transcriptRender struct {
+	Lines         []string
+	SelectedStart int
+	SelectedEnd   int
+}
+
 func newModel(service *app.Service) *modelUI {
 	composer := textarea.New()
 	composer.Placeholder = "Type a message..."
@@ -136,6 +148,9 @@ func newModel(service *app.Service) *modelUI {
 	messages.SoftWrap = true
 	messages.MouseWheelEnabled = true
 	messages.MouseWheelDelta = 2
+	messages.LeftGutterFunc = func(ctx viewport.GutterContext) string {
+		return " "
+	}
 
 	prompt := textinput.New()
 	prompt.Placeholder = "Type here"
@@ -149,7 +164,7 @@ func newModel(service *app.Service) *modelUI {
 		focus = "composer"
 		composer.Focus()
 	}
-	return &modelUI{
+	model := &modelUI{
 		service:  service,
 		state:    state,
 		events:   service.Events(),
@@ -160,6 +175,8 @@ func newModel(service *app.Service) *modelUI {
 		composer: composer,
 		prompt:   prompt,
 	}
+	model.messages.LeftGutterFunc = model.transcriptGutter
+	return model
 }
 
 func (m *modelUI) Init() tea.Cmd {
@@ -415,8 +432,12 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
 				return m, nil
 			}
+			if len(m.state.Transcript) > 0 {
+				m.transcriptIdx = len(m.state.Transcript) - 1
+			}
 			m.focus = "transcript"
 			m.composer.Blur()
+			m.syncTranscript(false)
 		} else {
 			m.focus = "composer"
 			m.composer.Focus()
@@ -761,10 +782,15 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 	if width <= 0 {
 		return
 	}
-	content := m.renderTranscript(m.state.Transcript, width)
-	wasAtBottom := forceBottom || m.messages.AtBottom()
+	rendered := m.renderTranscriptView(m.state.Transcript, width)
+	wasAtBottom := forceBottom || (m.focus != "transcript" && m.messages.AtBottom())
 	offset := m.messages.YOffset()
-	m.messages.SetContent(content)
+	m.messages.SetContentLines(rendered.Lines)
+	m.transcriptSel = transcriptSelection{StartLine: rendered.SelectedStart, EndLine: rendered.SelectedEnd}
+	if m.focus == "transcript" && rendered.SelectedStart >= 0 {
+		m.messages.EnsureVisible(rendered.SelectedStart, 0, 0)
+		return
+	}
 	if wasAtBottom {
 		m.messages.GotoBottom()
 		return
@@ -966,13 +992,22 @@ func (m *modelUI) renderPresence() string {
 }
 
 func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) string {
+	rendered := m.renderTranscriptView(entries, width)
+	return strings.Join(rendered.Lines, "\n")
+}
+
+func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width int) transcriptRender {
 	if width <= 0 {
 		width = 70
 	}
 	if len(entries) == 0 {
-		return mutedStyle.Render("No messages yet.")
+		return transcriptRender{
+			Lines:         []string{mutedStyle.Render("No messages yet.")},
+			SelectedStart: -1,
+			SelectedEnd:   -1,
+		}
 	}
-	var b strings.Builder
+	lines := make([]string, 0, len(entries)*4)
 	quoted := make(map[string]model.TranscriptEntry, len(entries))
 	for _, entry := range entries {
 		quoted[entry.ID] = entry
@@ -982,6 +1017,8 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 	prevReplyTo := ""
 	first := true
 	insertedUnread := false
+	selectedStart := -1
+	selectedEnd := -1
 	lastOpened := time.Time{}
 	if m.state.SelectedSwarm != nil {
 		lastOpened = m.state.SelectedSwarm.LastOpened
@@ -998,28 +1035,32 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 
 		if !first {
 			if sameSender {
-				b.WriteByte('\n')
+				lines = append(lines, "")
 			} else {
-				b.WriteString("\n\n")
+				lines = append(lines, "", "")
 			}
 		}
-		if !insertedUnread && !lastOpened.IsZero() && entry.SentAt.After(lastOpened) {
+		if !insertedUnread && !lastOpened.IsZero() && entry.SentAt.After(lastOpened) && !entry.Local {
 			if !first {
-				b.WriteString("\n\n")
+				lines = append(lines, "", "")
 			}
-			b.WriteString(accentStyle.Render("── new messages ──"))
-			b.WriteString("\n\n")
+			lines = append(lines, accentStyle.Render("── new messages ──"), "", "")
 			insertedUnread = true
 		}
 
 		selected := i == m.transcriptIdx && m.focus == "transcript"
 		var block string
 		if selected {
-			block = selectedStyle.Render(renderTranscriptEntryPlain(entry, sameSender, quoted, m.selfMentionHandle()))
+			block = selectedStyle.Render(renderTranscriptEntrySelected(entry, sameSender, quoted, m.selfMentionHandle()))
 		} else {
 			block = renderTranscriptEntry(entry, sameSender, quoted, m.selfMentionHandle())
 		}
-		b.WriteString(block)
+		blockLines := strings.Split(block, "\n")
+		if selected {
+			selectedStart = len(lines)
+			selectedEnd = len(lines) + len(blockLines) - 1
+		}
+		lines = append(lines, blockLines...)
 
 		if entry.Kind == "chat" {
 			prevSender = entry.SenderPeerID
@@ -1030,7 +1071,11 @@ func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) s
 		prevReplyTo = entry.ReplyTo
 		first = false
 	}
-	return b.String()
+	return transcriptRender{
+		Lines:         lines,
+		SelectedStart: selectedStart,
+		SelectedEnd:   selectedEnd,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,17 +1158,17 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, quoted map[
 	quote := renderReplyQuote(entry, quoted)
 	if continuation {
 		if quote != "" {
-			return quote + "\n" + bodyStyle.Render(entry.Body)
+			return quote + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
 		}
-		return bodyStyle.Render(entry.Body)
+		return renderChatBody(entry.Body, bodyStyle, selfHandle)
 	}
 	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
 	sep := mutedStyle.Render(" · ")
 	header := ts + sep + nameStyle.Render(entry.SenderName) + mentionBadge
 	if quote != "" {
-		return header + "\n" + quote + "\n" + bodyStyle.Render(entry.Body)
+		return header + "\n" + quote + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
 	}
-	return header + "\n" + bodyStyle.Render(entry.Body)
+	return header + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
 }
 
 func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
@@ -1170,6 +1215,19 @@ func renderTranscriptEntryPlain(entry model.TranscriptEntry, continuation bool, 
 	}
 }
 
+func renderTranscriptEntrySelected(entry model.TranscriptEntry, continuation bool, quoted map[string]model.TranscriptEntry, selfHandle string) string {
+	block := renderTranscriptEntryPlain(entry, continuation, quoted, selfHandle)
+	lines := strings.Split(block, "\n")
+	if len(lines) == 0 {
+		return block
+	}
+	lines[0] = "▶ " + lines[0]
+	for i := 1; i < len(lines); i++ {
+		lines[i] = "  " + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
 func copyInviteCmd(invite model.Invite) tea.Cmd {
 	status := "copied invite code"
 	if strings.TrimSpace(invite.SwarmName) != "" {
@@ -1206,7 +1264,7 @@ func (m *modelUI) chatFooterHelp() string {
 	} else {
 		parts = append(parts, "multiline unavailable in this terminal")
 	}
-	parts = append(parts, "r reply", "ctrl+r cancel reply", "pgup/pgdn scroll", "esc back")
+	parts = append(parts, "↑↓ select msg", "r reply", "ctrl+r cancel reply", "pgup/pgdn scroll", "esc back")
 	return strings.Join(parts, " · ")
 }
 
@@ -1296,6 +1354,9 @@ func (m *modelUI) renderComposerArea() string {
 	if m.replyTo != nil {
 		parts = append(parts, accentStyle.Render("Replying to "+m.replyTo.SenderName)+mutedStyle.Render(" · ctrl+r cancel"))
 		parts = append(parts, mutedStyle.Render(oneLineBody(m.replyTo.Body)))
+	}
+	if hint := m.mentionCompletionHint(); hint != "" {
+		parts = append(parts, accentStyle.Render(hint))
 	}
 	if typing := m.typingSummary(); typing != "" {
 		parts = append(parts, accentStyle.Render(typing))
@@ -1404,6 +1465,28 @@ func (m *modelUI) applyMentionCompletion() bool {
 	return false
 }
 
+func (m *modelUI) mentionCompletionHint() string {
+	if m.focus != "composer" {
+		return ""
+	}
+	value := m.composer.Value()
+	if value == "" {
+		return ""
+	}
+	start := strings.LastIndexAny(value, " \n\t")
+	token := value[start+1:]
+	if !strings.HasPrefix(token, "@") {
+		return ""
+	}
+	prefix := strings.TrimPrefix(token, "@")
+	for _, candidate := range m.mentionCandidates() {
+		if prefix == "" || strings.HasPrefix(candidate, strings.ToLower(prefix)) {
+			return "tab complete @" + candidate
+		}
+	}
+	return ""
+}
+
 func (m *modelUI) mentionCandidates() []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0)
@@ -1478,12 +1561,47 @@ func mentionsHandle(body, handle string) bool {
 		if !strings.HasPrefix(token, "@") {
 			continue
 		}
-		candidate := strings.Trim(strings.TrimPrefix(token, "@"), ".,:;!?()[]{}<>\"'")
+		candidate := cleanMentionToken(token)
 		if strings.EqualFold(candidate, handle) {
 			return true
 		}
 	}
 	return false
+}
+
+func renderChatBody(body string, bodyStyle lipgloss.Style, selfHandle string) string {
+	var out strings.Builder
+	var token strings.Builder
+	flushToken := func() {
+		if token.Len() == 0 {
+			return
+		}
+		value := token.String()
+		if strings.HasPrefix(value, "@") {
+			mentionStyle := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+			if selfHandle != "" && strings.EqualFold(cleanMentionToken(value), selfHandle) {
+				mentionStyle = lipgloss.NewStyle().Foreground(colorAccent2).Bold(true)
+			}
+			out.WriteString(mentionStyle.Render(value))
+		} else {
+			out.WriteString(bodyStyle.Render(value))
+		}
+		token.Reset()
+	}
+	for _, r := range body {
+		if r == '\n' || r == '\t' || r == ' ' {
+			flushToken()
+			out.WriteString(bodyStyle.Render(string(r)))
+			continue
+		}
+		token.WriteRune(r)
+	}
+	flushToken()
+	return out.String()
+}
+
+func cleanMentionToken(value string) string {
+	return strings.Trim(strings.TrimPrefix(value, "@"), ".,:;!?()[]{}<>\"'")
 }
 
 func renderReplyQuote(entry model.TranscriptEntry, quoted map[string]model.TranscriptEntry) string {
@@ -1565,6 +1683,16 @@ func (m *modelUI) restoreHighlightedNearby(previous string) {
 	if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
 		m.nearbyIdx = len(m.state.Nearby) - 1
 	}
+}
+
+func (m *modelUI) transcriptGutter(ctx viewport.GutterContext) string {
+	if m.focus != "transcript" {
+		return " "
+	}
+	if ctx.Index >= m.transcriptSel.StartLine && ctx.Index <= m.transcriptSel.EndLine {
+		return lipgloss.NewStyle().Foreground(colorAccent).Render("▎")
+	}
+	return " "
 }
 
 func (m *modelUI) notifyTyping(active bool) {

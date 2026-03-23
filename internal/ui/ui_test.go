@@ -8,6 +8,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
 	"yap/internal/app"
@@ -226,5 +227,74 @@ func TestConnectionSummaryReflectsPeerHealth(t *testing.T) {
 
 	if got := m.connectionSummary(); got != "◉ 2 online · 1 stale" {
 		t.Fatalf("connectionSummary() = %q", got)
+	}
+}
+
+func TestSyncTranscriptKeepsSelectedMessageVisible(t *testing.T) {
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "composer",
+		state:    app.State{Identity: model.Identity{Name: "me", PeerID: "self"}, SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
+		messages: viewport.New(),
+	}
+	m.messages.SoftWrap = true
+	m.messages.SetWidth(20)
+	m.messages.SetHeight(3)
+	for i := 0; i < 8; i++ {
+		m.state.Transcript = append(m.state.Transcript, model.TranscriptEntry{
+			ID:           string(rune('a' + i)),
+			Kind:         "chat",
+			SenderPeerID: "peer-1",
+			SenderName:   "Peer",
+			Body:         "message body",
+			SentAt:       time.Unix(int64(i), 0),
+		})
+	}
+
+	m.syncTranscript(true)
+	m.focus = "transcript"
+	m.transcriptIdx = 0
+	m.syncTranscript(false)
+
+	if got := m.messages.YOffset(); got != 0 {
+		t.Fatalf("messages.YOffset() = %d, want 0", got)
+	}
+}
+
+func TestRenderTranscriptDoesNotMarkLocalMessagesAsNew(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha", LastOpened: time.Unix(15, 0)},
+		},
+	}
+
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "msg-1", Kind: "chat", SenderPeerID: "self", SenderName: "Me", Body: "my update", Local: true, SentAt: time.Unix(20, 0)},
+		{ID: "msg-2", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "reply", SentAt: time.Unix(25, 0)},
+	}, 80)
+
+	localIndex := strings.Index(content, "Me")
+	dividerIndex := strings.Index(content, "── new messages ──")
+	remoteIndex := strings.Index(content, "Peer")
+	if !(localIndex >= 0 && dividerIndex > localIndex && remoteIndex > dividerIndex) {
+		t.Fatalf("unexpected divider ordering:\n%s", content)
+	}
+}
+
+func TestRenderTranscriptHighlightsMentionBadge(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "Colin", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+		},
+	}
+
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "msg-1", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "hey @colin", SentAt: time.Unix(20, 0)},
+	}, 80)
+
+	if !strings.Contains(content, "@you") {
+		t.Fatalf("renderTranscript() missing mention badge:\n%s", content)
 	}
 }

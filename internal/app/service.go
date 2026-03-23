@@ -496,6 +496,7 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 	}
 	selected := s.selectedID == entry.SwarmID
 	swarmName := s.swarmNameLocked(entry.SwarmID)
+	mentioned := s.entryMentionsIdentityLocked(entry)
 	if !selected && len(added) > 0 && entry.Kind == "chat" {
 		s.unread[entry.SwarmID] += len(added)
 	}
@@ -513,6 +514,10 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 		}
 	}
 	if !selected && entry.Kind == "chat" && swarmName != "" {
+		if mentioned {
+			s.emitToast(fmt.Sprintf("mention in %s from %s", swarmName, entry.SenderName))
+			return
+		}
 		s.emitToast(fmt.Sprintf("new message in %s from %s", swarmName, entry.SenderName))
 		return
 	}
@@ -757,6 +762,17 @@ func (s *Service) markSelectedSwarmRead(seenAt time.Time) error {
 	s.replaceSwarmLocked(swarm)
 	s.mu.Unlock()
 	return s.store.SaveSwarm(swarm)
+}
+
+func (s *Service) entryMentionsIdentityLocked(entry model.TranscriptEntry) bool {
+	if entry.Local || entry.Kind != "chat" {
+		return false
+	}
+	handle := mentionToken(s.identity.Name, s.identity.PeerID)
+	if handle == "" {
+		return false
+	}
+	return mentionsHandle(entry.Body, handle)
 }
 
 func (s *Service) reloadSwarmsLocked() error {
@@ -1010,6 +1026,60 @@ func countChatEntries(entries []model.TranscriptEntry) int {
 		}
 	}
 	return count
+}
+
+func mentionToken(name, peerID string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return strings.ToLower(shortID(peerID))
+	}
+	var b strings.Builder
+	dashed := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			dashed = false
+		case r == '-' || r == '_':
+			if !dashed && b.Len() > 0 {
+				b.WriteRune(r)
+				dashed = true
+			}
+		default:
+			if !dashed && b.Len() > 0 {
+				b.WriteByte('-')
+				dashed = true
+			}
+		}
+	}
+	handle := strings.Trim(b.String(), "-_")
+	if handle == "" {
+		return strings.ToLower(shortID(peerID))
+	}
+	return handle
+}
+
+func mentionsHandle(body, handle string) bool {
+	if handle == "" {
+		return false
+	}
+	for _, token := range strings.Fields(body) {
+		if !strings.HasPrefix(token, "@") {
+			continue
+		}
+		candidate := strings.Trim(strings.TrimPrefix(token, "@"), ".,:;!?()[]{}<>\"'")
+		if strings.EqualFold(candidate, handle) {
+			return true
+		}
+	}
+	return false
+}
+
+func shortID(id string) string {
+	if len(id) <= 10 {
+		return id
+	}
+	return id[:10]
 }
 
 func trustedPeersEqual(left, right []model.TrustedPeer) bool {

@@ -251,3 +251,40 @@ func TestLeaveSwarmMarksSelectedSwarmRead(t *testing.T) {
 		t.Fatalf("LastOpened = %v, want later than initial timestamp", persisted.LastOpened)
 	}
 }
+
+func TestHandleTranscriptEventEmitsMentionToastForBackgroundMessages(t *testing.T) {
+	svc := &Service{
+		ctx:          context.Background(),
+		identity:     model.Identity{Name: "Colin", PeerID: "self"},
+		swarms:       []model.Swarm{{ID: "swarm-1", Name: "Alpha"}},
+		nearby:       make(map[string]model.NearbyPeer),
+		transcripts:  make(map[string][]model.TranscriptEntry),
+		presence:     make(map[string][]model.Presence),
+		unread:       make(map[string]int),
+		connected:    map[string]bool{"swarm-1": true},
+		lastActivity: make(map[string]time.Time),
+		events:       make(chan Event, 8),
+	}
+
+	svc.handleTranscriptEvent(model.TranscriptEntry{
+		ID:           "msg-1",
+		SwarmID:      "swarm-1",
+		Kind:         "chat",
+		SenderPeerID: "peer-1",
+		SenderName:   "peer",
+		Body:         "hey @colin can you check this?",
+		SentAt:       time.Unix(10, 0),
+	}, false)
+
+	select {
+	case event := <-svc.events:
+		if event.Type != EventToast {
+			t.Fatalf("event.Type = %q, want %q", event.Type, EventToast)
+		}
+		if got, want := event.Message, "mention in Alpha from peer"; got != want {
+			t.Fatalf("event.Message = %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("expected mention toast event")
+	}
+}
