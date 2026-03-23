@@ -196,6 +196,31 @@ func TestSwarmHasTrustedPeer(t *testing.T) {
 	}
 }
 
+func TestResolvedPeerNamePrefersTrustedNameOverClaimed(t *testing.T) {
+	t.Parallel()
+
+	_, publicKey, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	author, err := peer.IDFromPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+
+	swarm := model.Swarm{
+		ID:   "swarm-1",
+		Name: "Alpha",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: author.String(), Name: "Trusted Name"},
+		},
+	}
+
+	if got, want := resolvedPeerName(swarm, author, "Claimed Name"), "Trusted Name"; got != want {
+		t.Fatalf("resolvedPeerName() = %q, want %q", got, want)
+	}
+}
+
 func TestClampEventTimeRejectsLargeSkew(t *testing.T) {
 	t.Parallel()
 

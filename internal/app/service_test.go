@@ -161,7 +161,82 @@ func TestSnapshotSortsSwarmsByRecentActivity(t *testing.T) {
 	}
 }
 
-func TestHandlePresenceEventDoesNotPersistTrustedPeers(t *testing.T) {
+func TestHandlePresenceEventUpdatesExistingTrustedPeerMetadata(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	st := store.New(root)
+	if err := st.Ensure(); err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+
+	swarm := model.Swarm{
+		ID:   "swarm-1",
+		Name: "Alpha",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-known", Name: "Known", Fingerprint: "known-fp"},
+		},
+	}
+	if err := st.SaveSwarm(swarm); err != nil {
+		t.Fatalf("SaveSwarm() error = %v", err)
+	}
+	svc := &Service{
+		ctx:          context.Background(),
+		store:        st,
+		swarms:       []model.Swarm{swarm},
+		nearby:       make(map[string]model.NearbyPeer),
+		transcripts:  make(map[string][]model.TranscriptEntry),
+		presence:     make(map[string][]model.Presence),
+		unread:       make(map[string]int),
+		connected:    map[string]bool{"swarm-1": true},
+		lastActivity: make(map[string]time.Time),
+		events:       make(chan Event, 8),
+	}
+
+	svc.handlePresenceEvent("swarm-1", []model.Presence{
+		{
+			PeerID:      "peer-known",
+			Name:        "Renamed Peer",
+			Fingerprint: "known-fp-2",
+			Addrs:       []string{"/ip4/127.0.0.1/tcp/4001"},
+			LastSeen:    time.Unix(20, 0),
+		},
+	})
+
+	updated, ok := svc.findSwarmLocked("swarm-1")
+	if !ok {
+		t.Fatal("swarm not found after presence update")
+	}
+	if got, want := len(updated.TrustedPeers), 1; got != want {
+		t.Fatalf("len(updated.TrustedPeers) = %d, want %d", got, want)
+	}
+	if got, want := updated.TrustedPeers[0].Name, "Renamed Peer"; got != want {
+		t.Fatalf("updated.TrustedPeers[0].Name = %q, want %q", got, want)
+	}
+	if got, want := updated.TrustedPeers[0].Fingerprint, "known-fp-2"; got != want {
+		t.Fatalf("updated.TrustedPeers[0].Fingerprint = %q, want %q", got, want)
+	}
+	if got, want := updated.TrustedPeers[0].Addrs[0], "/ip4/127.0.0.1/tcp/4001"; got != want {
+		t.Fatalf("updated.TrustedPeers[0].Addrs[0] = %q, want %q", got, want)
+	}
+	if got, want := updated.TrustedPeers[0].LastSeen, time.Unix(20, 0); !got.Equal(want) {
+		t.Fatalf("updated.TrustedPeers[0].LastSeen = %v, want %v", got, want)
+	}
+	if got, want := len(svc.presence["swarm-1"]), 1; got != want {
+		t.Fatalf("len(svc.presence[swarm-1]) = %d, want %d", got, want)
+	}
+	if got, want := svc.presence["swarm-1"][0].PeerID, "peer-known"; got != want {
+		t.Fatalf("svc.presence[swarm-1][0].PeerID = %q, want %q", got, want)
+	}
+
+	persisted, err := st.LoadSwarm("swarm-1")
+	if err != nil {
+		t.Fatalf("LoadSwarm() error = %v", err)
+	}
+	if got, want := persisted.TrustedPeers[0].Name, "Renamed Peer"; got != want {
+		t.Fatalf("persisted.TrustedPeers[0].Name = %q, want %q", got, want)
+	}
+}
+
+func TestHandlePresenceEventDoesNotAddUnknownTrustedPeer(t *testing.T) {
 	swarm := model.Swarm{
 		ID:   "swarm-1",
 		Name: "Alpha",

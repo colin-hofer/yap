@@ -1723,13 +1723,17 @@ func clampEventTime(sentAt time.Time) time.Time {
 }
 
 func resolvedPeerName(swarm model.Swarm, author peer.ID, claimed string) string {
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID != author.String() {
+			continue
+		}
+		if name := sanitizeDisplayName(trusted.Name); name != "" {
+			return name
+		}
+		break
+	}
 	if name := sanitizeDisplayName(claimed); name != "" {
 		return name
-	}
-	for _, trusted := range swarm.TrustedPeers {
-		if trusted.PeerID == author.String() && strings.TrimSpace(trusted.Name) != "" {
-			return trusted.Name
-		}
 	}
 	return author.String()
 }

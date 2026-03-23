@@ -553,7 +553,36 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 	}
 	s.mu.Lock()
 	s.presence[swarmID] = append([]model.Presence(nil), presence...)
+	swarm, ok := s.findSwarmLocked(swarmID)
+	if !ok {
+		s.mu.Unlock()
+		s.emitSync()
+		return
+	}
+	updated := false
+	for _, item := range presence {
+		if !swarmHasTrustedPeerID(swarm.TrustedPeers, item.PeerID) {
+			continue
+		}
+		next := mergeTrustedPeer(append([]model.TrustedPeer(nil), swarm.TrustedPeers...), model.TrustedPeer{
+			PeerID:      item.PeerID,
+			Name:        item.Name,
+			Fingerprint: item.Fingerprint,
+			Addrs:       append([]string(nil), item.Addrs...),
+			LastSeen:    item.LastSeen,
+		})
+		if !trustedPeersEqual(swarm.TrustedPeers, next) {
+			swarm.TrustedPeers = next
+			updated = true
+		}
+	}
+	if updated {
+		s.replaceSwarmLocked(swarm)
+	}
 	s.mu.Unlock()
+	if updated {
+		_ = s.store.SaveSwarm(swarm)
+	}
 	s.emitSync()
 }
 
@@ -1065,6 +1094,19 @@ func trustedPeersEqual(left, right []model.TrustedPeer) bool {
 		}
 	}
 	return true
+}
+
+func swarmHasTrustedPeerID(peers []model.TrustedPeer, peerID string) bool {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return false
+	}
+	for _, trusted := range peers {
+		if trusted.PeerID == peerID {
+			return true
+		}
+	}
+	return false
 }
 
 func stringSlicesEqual(left, right []string) bool {
