@@ -161,21 +161,16 @@ func TestSnapshotSortsSwarmsByRecentActivity(t *testing.T) {
 	}
 }
 
-func TestHandlePresenceEventPersistsPeerAddrs(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "state")
-	st := store.New(root)
-	if err := st.Ensure(); err != nil {
-		t.Fatalf("Ensure() error = %v", err)
+func TestHandlePresenceEventDoesNotPersistTrustedPeers(t *testing.T) {
+	swarm := model.Swarm{
+		ID:   "swarm-1",
+		Name: "Alpha",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-known", Name: "Known", Fingerprint: "known-fp"},
+		},
 	}
-
-	swarm := model.Swarm{ID: "swarm-1", Name: "Alpha"}
-	if err := st.SaveSwarm(swarm); err != nil {
-		t.Fatalf("SaveSwarm() error = %v", err)
-	}
-
 	svc := &Service{
 		ctx:          context.Background(),
-		store:        st,
 		swarms:       []model.Swarm{swarm},
 		nearby:       make(map[string]model.NearbyPeer),
 		transcripts:  make(map[string][]model.TranscriptEntry),
@@ -202,8 +197,14 @@ func TestHandlePresenceEventPersistsPeerAddrs(t *testing.T) {
 	if got, want := len(updated.TrustedPeers), 1; got != want {
 		t.Fatalf("len(updated.TrustedPeers) = %d, want %d", got, want)
 	}
-	if got, want := updated.TrustedPeers[0].Addrs[0], "/ip4/127.0.0.1/tcp/4001"; got != want {
-		t.Fatalf("updated.TrustedPeers[0].Addrs[0] = %q, want %q", got, want)
+	if got, want := updated.TrustedPeers[0].PeerID, "peer-known"; got != want {
+		t.Fatalf("updated.TrustedPeers[0].PeerID = %q, want %q", got, want)
+	}
+	if got, want := len(svc.presence["swarm-1"]), 1; got != want {
+		t.Fatalf("len(svc.presence[swarm-1]) = %d, want %d", got, want)
+	}
+	if got, want := svc.presence["swarm-1"][0].PeerID, "peer-1"; got != want {
+		t.Fatalf("svc.presence[swarm-1][0].PeerID = %q, want %q", got, want)
 	}
 }
 

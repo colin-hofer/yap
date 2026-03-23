@@ -151,6 +151,51 @@ func TestVerifiedClaimedPeerUsesAuthenticatedIdentity(t *testing.T) {
 	}
 }
 
+func TestSwarmHasTrustedPeer(t *testing.T) {
+	t.Parallel()
+
+	_, publicKeyA, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	peerA, err := peer.IDFromPublicKey(publicKeyA)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+	_, publicKeyB, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	peerB, err := peer.IDFromPublicKey(publicKeyB)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+	_, publicKeyC, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	peerC, err := peer.IDFromPublicKey(publicKeyC)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+
+	swarm := model.Swarm{
+		ID:   "swarm-1",
+		Name: "Alpha",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: peerA.String()},
+			{PeerID: peerB.String()},
+		},
+	}
+
+	if !swarmHasTrustedPeer(swarm, peerA) {
+		t.Fatal("swarmHasTrustedPeer() = false, want true for trusted peer")
+	}
+	if swarmHasTrustedPeer(swarm, peerC) {
+		t.Fatal("swarmHasTrustedPeer() = true, want false for untrusted peer")
+	}
+}
+
 func TestClampEventTimeRejectsLargeSkew(t *testing.T) {
 	t.Parallel()
 

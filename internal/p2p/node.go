@@ -951,6 +951,9 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 		if author == "" {
 			continue
 		}
+		if !swarmHasTrustedPeer(active.Swarm, author) {
+			continue
+		}
 		bodyBytes, err := yapcrypto.Decrypt(active.Swarm.RoomKey, env.Nonce, env.Ciphertext)
 		if err != nil {
 			continue
@@ -1729,6 +1732,18 @@ func resolvedPeerName(swarm model.Swarm, author peer.ID, claimed string) string 
 		}
 	}
 	return author.String()
+}
+
+func swarmHasTrustedPeer(swarm model.Swarm, author peer.ID) bool {
+	if author == "" {
+		return false
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID == author.String() {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) peerFingerprint(author peer.ID) string {

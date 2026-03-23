@@ -553,37 +553,7 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 	}
 	s.mu.Lock()
 	s.presence[swarmID] = append([]model.Presence(nil), presence...)
-	swarm, ok := s.findSwarmLocked(swarmID)
-	if !ok {
-		s.mu.Unlock()
-		s.emitSync()
-		return
-	}
-	updated := false
-	for _, item := range presence {
-		if item.PeerID == "" {
-			continue
-		}
-		peerInfo := model.TrustedPeer{
-			PeerID:      item.PeerID,
-			Name:        item.Name,
-			Fingerprint: item.Fingerprint,
-			Addrs:       append([]string(nil), item.Addrs...),
-		}
-		next := mergeTrustedPeer(swarm.TrustedPeers, peerInfo)
-		if !trustedPeersEqual(swarm.TrustedPeers, next) {
-			swarm.TrustedPeers = next
-			updated = true
-		}
-	}
-	if updated {
-		s.replaceSwarmLocked(swarm)
-	}
 	s.mu.Unlock()
-
-	if updated {
-		_ = s.store.SaveSwarm(swarm)
-	}
 	s.emitSync()
 }
 
