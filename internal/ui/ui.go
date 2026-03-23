@@ -100,10 +100,12 @@ type modelUI struct {
 	emojiResults []emoji.Entry
 	emojiIdx     int
 
-	messages viewport.Model
-	composer textarea.Model
-	prompt   textinput.Model
-	modal    modalState
+	messages    viewport.Model
+	composer    textarea.Model
+	prompt      textinput.Model
+	modal       modalState
+	modalQueue  []modalState
+	hasNewBelow bool
 }
 
 type modalState struct {
@@ -252,7 +254,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("already up to date (%s)", displayVersion(msg.Result.LatestVersion))
 			return m, nil
 		}
-		m.modal = modalState{
+		m.pushModal(modalState{
 			Kind:  "update",
 			Title: "Install Update",
 			Message: fmt.Sprintf(
@@ -260,7 +262,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				displayVersion(msg.Result.PreviousVersion),
 				displayVersion(msg.Result.LatestVersion),
 			),
-		}
+		})
 		return m, nil
 	case typingTickMsg:
 		m.typingFrame = (m.typingFrame + 1) % 3
@@ -284,6 +286,9 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == "chat" && m.modal.Kind == "" {
 			var cmd tea.Cmd
 			m.messages, cmd = m.messages.Update(msg)
+			if m.messages.AtBottom() {
+				m.hasNewBelow = false
+			}
 			return m, cmd
 		}
 		return m, nil
@@ -467,18 +472,25 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "pgdown", "pagedown":
 		m.messages.PageDown()
+		if m.messages.AtBottom() {
+			m.hasNewBelow = false
+		}
 		return m, nil
 	case "home":
 		m.messages.GotoTop()
 		return m, nil
 	case "end":
 		m.messages.GotoBottom()
+		m.hasNewBelow = false
 		return m, nil
 	case "ctrl+u":
 		m.messages.HalfPageUp()
 		return m, nil
 	case "ctrl+d":
 		m.messages.HalfPageDown()
+		if m.messages.AtBottom() {
+			m.hasNewBelow = false
+		}
 		return m, nil
 	case "up":
 		if m.emojiActive() {
@@ -549,7 +561,7 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, copyInviteCmd(*m.modal.Invite)
 			}
 		case "esc", "enter", " ":
-			m.modal = modalState{}
+			m.dismissModal()
 		}
 		return m, nil
 	case "approval":
@@ -558,12 +570,12 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if m.modal.Approval != nil && m.modal.Approval.Approval != nil {
 				_ = m.service.ResolveApproval(m.modal.Approval.Approval.ID, true)
 			}
-			m.modal = modalState{}
+			m.dismissModal()
 		case "n", "esc":
 			if m.modal.Approval != nil && m.modal.Approval.Approval != nil {
 				_ = m.service.ResolveApproval(m.modal.Approval.Approval.ID, false)
 			}
-			m.modal = modalState{}
+			m.dismissModal()
 		}
 		return m, nil
 	case "remove":
@@ -574,9 +586,9 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.status = fmt.Sprintf("removed %s locally", m.modal.SwarmName)
 			}
-			m.modal = modalState{}
+			m.dismissModal()
 		case "n", "esc":
-			m.modal = modalState{}
+			m.dismissModal()
 		}
 		return m, nil
 	case "update":
@@ -584,10 +596,10 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "y", "enter":
 			m.updateRequested = true
 			m.status = "closing to install the latest release"
-			m.modal = modalState{}
+			m.dismissModal()
 			return m, tea.Quit
 		case "n", "esc":
-			m.modal = modalState{}
+			m.dismissModal()
 			m.status = "update canceled"
 		}
 		return m, nil
@@ -598,7 +610,7 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *modelUI) handleCreateSwarmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.modal = modalState{}
+		m.dismissModal()
 		return m, nil
 	case "enter":
 		swarm, err := m.service.CreateSwarm(m.prompt.Value())
@@ -606,7 +618,7 @@ func (m *modelUI) handleCreateSwarmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 			m.status = err.Error()
 			return m, nil
 		}
-		m.modal = modalState{}
+		m.dismissModal()
 		if err := m.service.OpenSwarm(swarm.ID); err != nil {
 			m.status = err.Error()
 		}
@@ -620,14 +632,14 @@ func (m *modelUI) handleCreateSwarmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 func (m *modelUI) handleRenameModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.modal = modalState{}
+		m.dismissModal()
 		return m, nil
 	case "enter":
 		if err := m.service.RenameIdentity(m.prompt.Value()); err != nil {
 			m.status = err.Error()
 			return m, nil
 		}
-		m.modal = modalState{}
+		m.dismissModal()
 		m.status = "updated display name"
 		return m, nil
 	}
@@ -639,7 +651,7 @@ func (m *modelUI) handleRenameModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.modal = modalState{}
+		m.dismissModal()
 		return m, nil
 	case "enter":
 		peerInfo := m.selectedNearby()
@@ -651,7 +663,7 @@ func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = err.Error()
 			return m, nil
 		}
-		m.modal = modalState{}
+		m.dismissModal()
 		m.status = fmt.Sprintf("pairing with %s", nearbyLabel(*peerInfo))
 		return m, nil
 	}
@@ -735,12 +747,12 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			title = "Invite " + event.Invite.SwarmName
 			message = fmt.Sprintf("Share this code to invite someone into %s.", event.Invite.SwarmName)
 		}
-		m.modal = modalState{
+		m.pushModal(modalState{
 			Kind:    "invite",
 			Title:   title,
 			Message: message,
 			Invite:  event.Invite,
-		}
+		})
 		if event.Invite != nil {
 			return copyInviteCmd(*event.Invite)
 		}
@@ -752,12 +764,12 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
-		m.modal = modalState{
+		m.pushModal(modalState{
 			Kind:     "approval",
 			Title:    "Approve Pairing",
 			Message:  approvalMessage(event),
 			Approval: &event,
-		}
+		})
 		return nil
 	}
 	return nil
@@ -777,13 +789,17 @@ func (m *modelUI) syncLayout() {
 		if chatWidth < 30 {
 			chatWidth = m.width
 		}
-		msgHeight := m.height - 11
-		if msgHeight < 6 {
-			msgHeight = 6
+		contentWidth := chatWidth - 6
+		if contentWidth < 10 {
+			contentWidth = 10
 		}
-		m.messages.SetWidth(chatWidth - 6)
+		msgHeight := m.height - 12
+		if msgHeight < 4 {
+			msgHeight = 4
+		}
+		m.messages.SetWidth(contentWidth)
 		m.messages.SetHeight(msgHeight)
-		m.composer.SetWidth(chatWidth - 6)
+		m.composer.SetWidth(contentWidth)
 	}
 }
 
@@ -798,7 +814,17 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 	m.messages.SetContentLines(rendered.Lines)
 	if wasAtBottom {
 		m.messages.GotoBottom()
+		m.hasNewBelow = false
 		return
+	}
+	// New content arrived while scrolled up.
+	m.hasNewBelow = true
+	maxOffset := len(rendered.Lines) - m.messages.Height()
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
 	}
 	m.messages.SetYOffset(offset)
 }
@@ -825,6 +851,9 @@ func (m *modelUI) renderHome(width, height int) string {
 	}
 
 	panelHeight := height - 6
+	if panelHeight < 4 {
+		panelHeight = 4
+	}
 	leftStyle, rightStyle := panelStyle, panelStyle
 	if m.transitionFrame > 0 {
 		transStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.transitionBorderColor()).Padding(1, 2)
@@ -936,6 +965,10 @@ func (m *modelUI) renderChat(width, height int) string {
 		mainWidth = width
 		sidebarWidth = 0
 	}
+	contentWidth := mainWidth - 6
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
 	msgHeight := height - 12 // always reserve 1 line for typing indicator
 	// Reserve additional space for emoji picker above composer
 	emojiLines := m.emojiExtraLines()
@@ -943,20 +976,29 @@ func (m *modelUI) renderChat(width, height int) string {
 	if msgHeight < 4 {
 		msgHeight = 4
 	}
-	m.messages.SetWidth(mainWidth - 6)
+	m.messages.SetWidth(contentWidth)
 	m.messages.SetHeight(msgHeight)
-	m.composer.SetWidth(mainWidth - 6)
+	m.composer.SetWidth(contentWidth)
 
-	panelHeight := msgHeight + 5 + emojiLines // +5 = composer(3) + gap(1) + typing(1)
+	newMsgLine := 0
+	if m.hasNewBelow && !m.messages.AtBottom() {
+		newMsgLine = 1
+	}
+	panelHeight := msgHeight + 5 + emojiLines + newMsgLine // +5 = composer(3) + gap(1) + typing(1)
 
 	mainStyle := focusedPanelStyle
 	if m.transitionFrame > 0 {
 		mainStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.transitionBorderColor()).Padding(1, 2)
 	}
 
-	main := mainStyle.Width(mainWidth).Height(panelHeight).Render(
-		m.messages.View() + "\n\n" + m.renderComposerArea(),
-	)
+	var chatContent string
+	if m.hasNewBelow && !m.messages.AtBottom() {
+		pill := accentStyle.Render("↓ new messages")
+		chatContent = m.messages.View() + "\n" + pill + "\n" + m.renderComposerArea()
+	} else {
+		chatContent = m.messages.View() + "\n\n" + m.renderComposerArea()
+	}
+	main := mainStyle.Width(mainWidth).Height(panelHeight).Render(chatContent)
 
 	body := main
 	if sidebarWidth > 0 {
@@ -983,11 +1025,14 @@ func (m *modelUI) renderPresence() string {
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines, "")
+	// Sidebar content width: 26 total - 2 border - 4 padding = 20 usable.
+	const sidebarContent = 20
 	for _, presence := range m.state.Presence {
 		name := presence.Name
 		if strings.TrimSpace(name) == "" {
 			name = shortID(presence.PeerID)
 		}
+		name = truncate(name, sidebarContent-2) // 2 for dot+space
 		dot := presenceDot(presence.State)
 		nameColor := colorStrong
 		if presence.State == "stale" {
@@ -996,9 +1041,9 @@ func (m *modelUI) renderPresence() string {
 			nameColor = colorMuted
 		}
 		label := dot + " " + lipgloss.NewStyle().Foreground(nameColor).Render(name)
-		handle := mentionToken(name, presence.PeerID)
+		handle := mentionToken(presence.Name, presence.PeerID)
 		if handle != "" {
-			label += mutedStyle.Render("  @" + handle)
+			label += mutedStyle.Render("  @" + truncate(handle, sidebarContent-6))
 		}
 		if presence.Typing && presence.PeerID != m.state.Identity.PeerID {
 			label += accentStyle.Render("  " + m.typingDots())
@@ -1202,18 +1247,23 @@ func copyTextCmd(text, status string) tea.Cmd {
 }
 
 func (m *modelUI) homeFooterHelp() string {
+	w := m.width
 	if m.focus == "nearby" {
+		if w > 0 && w < 80 {
+			return "tab swarms · ↑↓ select · n new · j join · r rename\nu update · q quit"
+		}
 		return "tab swarms · ↑↓ select · n new swarm · j join selected nearby · r rename self · u update · q quit"
 	}
-	return "tab nearby · ↑↓ select · enter open swarm · n new swarm · r rename self · i invite selected swarm · d remove selected swarm · u update · q quit"
+	if w > 0 && w < 100 {
+		return "tab nearby · ↑↓ select · enter open · n new · r rename\ni invite · d remove · u update · q quit"
+	}
+	return "tab nearby · ↑↓ select · enter open swarm · n new swarm · r rename self · i invite · d remove · u update · q quit"
 }
 
 func (m *modelUI) chatFooterHelp() string {
-	parts := []string{"enter send", "tab complete @mention", "/e emoji"}
+	parts := []string{"enter send", "tab @mention", "/e emoji"}
 	if m.keyDisambiguation {
 		parts = append(parts, "shift+enter newline")
-	} else {
-		parts = append(parts, "multiline unavailable in this terminal")
 	}
 	parts = append(parts, "pgup/pgdn scroll", "esc back")
 	return strings.Join(parts, " · ")
@@ -1271,6 +1321,20 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:10]
+}
+
+func truncate(s string, max int) string {
+	if max < 1 {
+		max = 1
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return string(runes[:max-1]) + "…"
 }
 
 func selectedSwarmID(state app.State) string {
@@ -1722,6 +1786,25 @@ func (m *modelUI) notifyTyping(active bool) {
 		return
 	}
 	m.service.NotifyTyping(active)
+}
+
+// pushModal shows a modal immediately if none is active, otherwise queues it.
+func (m *modelUI) pushModal(ms modalState) {
+	if m.modal.Kind == "" {
+		m.modal = ms
+		return
+	}
+	m.modalQueue = append(m.modalQueue, ms)
+}
+
+// dismissModal closes the current modal and shows the next queued one if any.
+func (m *modelUI) dismissModal() {
+	if len(m.modalQueue) > 0 {
+		m.modal = m.modalQueue[0]
+		m.modalQueue = m.modalQueue[1:]
+		return
+	}
+	m.dismissModal()
 }
 
 func displayVersion(value string) string {
