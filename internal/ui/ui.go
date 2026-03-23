@@ -936,10 +936,10 @@ func (m *modelUI) renderChat(width, height int) string {
 		mainWidth = width
 		sidebarWidth = 0
 	}
-	msgHeight := height - 11
-	// Reserve space for emoji picker and typing indicator above composer
-	extraLines := m.composerExtraLines()
-	msgHeight -= extraLines
+	msgHeight := height - 12 // always reserve 1 line for typing indicator
+	// Reserve additional space for emoji picker above composer
+	emojiLines := m.emojiExtraLines()
+	msgHeight -= emojiLines
 	if msgHeight < 4 {
 		msgHeight = 4
 	}
@@ -947,7 +947,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	m.messages.SetHeight(msgHeight)
 	m.composer.SetWidth(mainWidth - 6)
 
-	panelHeight := msgHeight + 4 + extraLines
+	panelHeight := msgHeight + 5 + emojiLines // +5 = composer(3) + gap(1) + typing(1)
 
 	mainStyle := focusedPanelStyle
 	if m.transitionFrame > 0 {
@@ -1306,8 +1306,11 @@ func (m *modelUI) renderComposerArea() string {
 	} else if hint := m.mentionCompletionHint(); hint != "" {
 		parts = append(parts, accentStyle.Render(hint))
 	}
+	// Always render a typing line to keep layout stable
 	if typing := m.typingSummary(); typing != "" {
 		parts = append(parts, accentStyle.Render(typing))
+	} else {
+		parts = append(parts, "")
 	}
 	parts = append(parts, m.composer.View())
 	return strings.Join(parts, "\n")
@@ -1855,24 +1858,19 @@ func (m *modelUI) applyEmojiCompletion() {
 	m.emojiIdx = 0
 }
 
-// composerExtraLines returns the number of extra lines rendered above the
-// composer input (emoji picker, mention hint, typing indicator).
-func (m *modelUI) composerExtraLines() int {
+// emojiExtraLines returns the number of extra lines the emoji picker adds
+// above the composer (beyond the always-reserved typing indicator line).
+func (m *modelUI) emojiExtraLines() int {
+	if !m.emojiActive() {
+		return 0
+	}
 	n := 0
-	if m.emojiActive() {
-		// emoji results + help line
-		if len(m.emojiResults) > 0 {
-			n += len(m.emojiResults)
-		} else {
-			n++ // "no matches" or "type to search"
-		}
-		n++ // help line
-	} else if m.mentionCompletionHint() != "" {
-		n++
+	if len(m.emojiResults) > 0 {
+		n += len(m.emojiResults)
+	} else {
+		n++ // "no matches" or "type to search"
 	}
-	if m.typingSummary() != "" {
-		n++
-	}
+	n++ // help line
 	return n
 }
 
