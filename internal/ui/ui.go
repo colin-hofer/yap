@@ -717,6 +717,10 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
 			m.syncTranscript(false)
 		}
+		if m.anyoneTyping() && m.mode == "chat" && !m.typingTicking {
+			m.typingTicking = true
+			return typingTickCmd()
+		}
 		return nil
 	case app.EventInvite:
 		if event.Snapshot.Version < m.state.Version {
@@ -933,14 +937,17 @@ func (m *modelUI) renderChat(width, height int) string {
 		sidebarWidth = 0
 	}
 	msgHeight := height - 11
-	if msgHeight < 8 {
-		msgHeight = 8
+	// Reserve space for emoji picker and typing indicator above composer
+	extraLines := m.composerExtraLines()
+	msgHeight -= extraLines
+	if msgHeight < 4 {
+		msgHeight = 4
 	}
 	m.messages.SetWidth(mainWidth - 6)
 	m.messages.SetHeight(msgHeight)
 	m.composer.SetWidth(mainWidth - 6)
 
-	panelHeight := msgHeight + 4
+	panelHeight := msgHeight + 4 + extraLines
 
 	mainStyle := focusedPanelStyle
 	if m.transitionFrame > 0 {
@@ -1846,6 +1853,27 @@ func (m *modelUI) applyEmojiCompletion() {
 	m.composer.SetValue(prefix + selected.Char + " ")
 	m.emojiResults = nil
 	m.emojiIdx = 0
+}
+
+// composerExtraLines returns the number of extra lines rendered above the
+// composer input (emoji picker, mention hint, typing indicator).
+func (m *modelUI) composerExtraLines() int {
+	n := 0
+	if m.emojiActive() {
+		// emoji results + help line
+		if len(m.emojiResults) > 0 {
+			n += len(m.emojiResults)
+		} else {
+			n++ // "no matches" or "type to search"
+		}
+		n++ // help line
+	} else if m.mentionCompletionHint() != "" {
+		n++
+	}
+	if m.typingSummary() != "" {
+		n++
+	}
+	return n
 }
 
 // renderEmojiHint renders the inline emoji picker above the composer.
