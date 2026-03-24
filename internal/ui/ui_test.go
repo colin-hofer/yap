@@ -628,8 +628,8 @@ func TestViewMinimumTerminalSize(t *testing.T) {
 	}
 
 	v := m.View()
-	if !strings.Contains(v.Body, "too small") {
-		t.Fatalf("View() should show 'too small' at tiny size, got:\n%s", v.Body)
+	if !strings.Contains(v.Content, "too small") {
+		t.Fatalf("View() should show 'too small' at tiny size, got:\n%s", v.Content)
 	}
 }
 
