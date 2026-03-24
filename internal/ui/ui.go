@@ -17,6 +17,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"yap/internal/app"
+	"yap/internal/ascii"
 	"yap/internal/emoji"
 	"yap/internal/model"
 	"yap/internal/update"
@@ -292,6 +293,14 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	case tea.PasteMsg:
+		// When an image path is pasted (e.g. drag-and-drop), convert to ASCII art.
+		if m.mode == "chat" && m.modal.Kind == "" {
+			if art, err := ascii.Convert(strings.TrimSpace(msg.Content), m.asciiWidth()); err == nil {
+				m.composer.SetValue(art)
+				return m, nil
+			}
+		}
 	case tea.KeyPressMsg:
 		if m.modal.Kind != "" {
 			return m.handleModal(msg)
@@ -773,6 +782,20 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+// asciiWidth returns a suitable character width for ASCII art, matching the
+// chat content area so the art fits without wrapping.
+func (m *modelUI) asciiWidth() int {
+	w := m.width - 26 // sidebar
+	if w < 30 {
+		w = m.width
+	}
+	w -= 6 // chat padding/border
+	if w < 20 {
+		w = 60 // sensible fallback
+	}
+	return w
 }
 
 // ---------------------------------------------------------------------------
