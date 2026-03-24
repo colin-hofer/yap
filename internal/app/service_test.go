@@ -98,6 +98,87 @@ func TestPrepareSwarmRotationRemovesPeerAndBumpsVersion(t *testing.T) {
 	}
 }
 
+func TestHandleSwarmRevocationMarksSwarmRevokedAndClearsSelection(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	st := store.New(root)
+	if err := st.Ensure(); err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+
+	swarm := model.Swarm{
+		ID:          "swarm-1",
+		Name:        "Alpha",
+		RoomKey:     "room-key",
+		OwnerPeerID: "peer-owner",
+		Version:     2,
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-owner", Name: "Owner"},
+			{PeerID: "peer-self", Name: "Self"},
+		},
+	}
+	if err := st.SaveSwarm(swarm); err != nil {
+		t.Fatalf("SaveSwarm() error = %v", err)
+	}
+
+	svc := &Service{
+		ctx:          context.Background(),
+		store:        st,
+		node:         &p2p.Node{},
+		identity:     model.Identity{Name: "Self", PeerID: "peer-self"},
+		swarms:       []model.Swarm{swarm},
+		nearby:       make(map[string]model.NearbyPeer),
+		transcripts:  make(map[string][]model.TranscriptEntry),
+		presence:     map[string][]model.Presence{"swarm-1": {{PeerID: "peer-owner", State: "online"}}},
+		unread:       make(map[string]int),
+		connected:    map[string]bool{"swarm-1": true},
+		lastActivity: make(map[string]time.Time),
+		selectedID:   "swarm-1",
+		events:       make(chan Event, 8),
+	}
+
+	svc.handleSwarmRevocation(p2p.SwarmRevocation{
+		SwarmID:   "swarm-1",
+		SwarmName: "Alpha",
+		Version:   3,
+		Actor:     model.TrustedPeer{PeerID: "peer-owner", Name: "Owner"},
+	})
+
+	updated, ok := svc.findSwarmLocked("swarm-1")
+	if !ok {
+		t.Fatal("swarm not found after revocation")
+	}
+	if !updated.Revoked {
+		t.Fatal("updated.Revoked = false, want true")
+	}
+	if got, want := updated.Version, uint64(3); got != want {
+		t.Fatalf("updated.Version = %d, want %d", got, want)
+	}
+	if got := svc.selectedID; got != "" {
+		t.Fatalf("selectedID = %q, want empty", got)
+	}
+	if got := len(svc.presence["swarm-1"]); got != 0 {
+		t.Fatalf("len(presence) = %d, want 0", got)
+	}
+}
+
+func TestSendChatRejectsRevokedSwarm(t *testing.T) {
+	svc := &Service{
+		ctx:      context.Background(),
+		identity: model.Identity{Name: "Self", PeerID: "peer-self"},
+		swarms: []model.Swarm{{
+			ID:      "swarm-1",
+			Name:    "Alpha",
+			Revoked: true,
+		}},
+		selectedID: "swarm-1",
+	}
+
+	err := svc.SendChat("hello")
+	if err == nil {
+		t.Fatal("SendChat() unexpectedly allowed chat in a revoked swarm")
+	}
+}
+
 func TestHandleHistoryImportCountsOnlyChatEntries(t *testing.T) {
 	svc := &Service{
 		ctx:          context.Background(),

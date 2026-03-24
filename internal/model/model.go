@@ -45,6 +45,8 @@ type Swarm struct {
 	RoomKey      string        `json:"room_key"`
 	OwnerPeerID  string        `json:"owner_peer_id,omitempty"`
 	Version      uint64        `json:"version,omitempty"`
+	Revoked      bool          `json:"revoked,omitempty"`
+	RevokedAt    time.Time     `json:"revoked_at,omitempty"`
 	TrustedPeers []TrustedPeer `json:"trusted_peers,omitempty"`
 	LastOpened   time.Time     `json:"last_opened,omitempty"`
 }

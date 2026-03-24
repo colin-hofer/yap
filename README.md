@@ -134,7 +134,7 @@ All app-managed files are written with private permissions.
 
 Internally, each swarm maps to a libp2p GossipSub channel named like `yap/swarm/<room-topic-hash>/v3`, where the topic hash is derived from the shared room key. That channel is just the pubsub transport used to move encrypted chat and presence messages between trusted peers in the same swarm.
 
-Membership changes and room-key rotations are not broadcast on the old room topic. Instead, the room owner pushes the new swarm config directly to the remaining trusted peers over an authenticated libp2p stream, and those peers reopen the swarm on the new topic derived from the rotated room key.
+Membership changes and room-key rotations are not broadcast on the old room topic. Instead, the room owner pushes the new swarm config directly to the remaining trusted peers over an authenticated libp2p stream, and those peers reopen the swarm on the new topic derived from the rotated room key. When a peer is revoked, that removed peer gets a separate revocation notice so the old room is closed locally and shown as revoked instead of silently going dead.
 
 The current build defaults to TCP libp2p listeners for stability on Go 1.26.x. QUIC can be enabled experimentally with:
 

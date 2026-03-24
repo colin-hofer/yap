@@ -73,6 +73,7 @@ const (
 	EventHistory        EventKind = "history"
 	EventPresence       EventKind = "presence"
 	EventSwarmUpdate    EventKind = "swarm_update"
+	EventSwarmRevoked   EventKind = "swarm_revoked"
 )
 
 // Event describes a state change from the node.
@@ -85,6 +86,7 @@ type Event struct {
 	Approval    *Approval
 	Pair        *PairResult
 	SwarmUpdate *SwarmUpdate
+	Revocation  *SwarmRevocation
 	Entry       *model.TranscriptEntry
 	Entries     []model.TranscriptEntry
 	Presence    []model.Presence
@@ -112,6 +114,15 @@ type SwarmUpdate struct {
 	Reason string
 	Actor  model.TrustedPeer
 	Target *model.TrustedPeer
+}
+
+// SwarmRevocation is emitted to the removed peer so they can close the old
+// swarm locally and understand why it stopped working.
+type SwarmRevocation struct {
+	SwarmID   string
+	SwarmName string
+	Version   uint64
+	Actor     model.TrustedPeer
 }
 
 // Node hosts discovery, pairing, pubsub, and room presence.
@@ -822,6 +833,10 @@ func (n *Node) BroadcastSwarmUpdate(swarm model.Swarm, reason string, target *mo
 		}
 		go n.sendSwarmUpdate(swarm, trusted, normalizeSwarmUpdateReason(reason), targetCopy, false)
 	}
+	if normalizeSwarmUpdateReason(reason) == "revoke" && target != nil && target.PeerID != n.host.ID().String() && !swarmHasTrustedPeerID(swarm, target.PeerID) {
+		targetCopy := *target
+		go n.sendRevocationNotice(swarm, targetCopy)
+	}
 }
 
 func (n *Node) handleSwarmStream(stream network.Stream) {
@@ -830,6 +845,10 @@ func (n *Node) handleSwarmStream(stream network.Stream) {
 
 	var frame swarmUpdateFrame
 	if err := json.NewDecoder(stream).Decode(&frame); err != nil {
+		return
+	}
+	if normalizeSwarmUpdateReason(frame.Reason) == "revoked" {
+		n.handleRevocationNotice(stream, frame)
 		return
 	}
 
@@ -1409,6 +1428,80 @@ func (n *Node) sendSwarmUpdate(swarm model.Swarm, trusted model.TrustedPeer, rea
 	_ = json.NewEncoder(stream).Encode(frame)
 }
 
+func (n *Node) sendRevocationNotice(swarm model.Swarm, removed model.TrustedPeer) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if strings.TrimSpace(removed.PeerID) == "" || removed.PeerID == n.host.ID().String() {
+		return
+	}
+
+	peerID, err := peer.Decode(removed.PeerID)
+	if err != nil {
+		return
+	}
+	n.addTrustedPeerAddrs(removed)
+
+	ctx, cancel := context.WithTimeout(n.ctx, historyStreamTimeout)
+	defer cancel()
+
+	stream, err := n.host.NewStream(ctx, peerID, swarmProtocolID)
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(historyStreamTimeout))
+
+	frame := swarmUpdateFrame{
+		Swarm: wireSwarm{
+			ID:          swarm.ID,
+			Name:        swarm.Name,
+			OwnerPeerID: swarmOwnerPeerID(swarm),
+			Version:     swarmVersion(swarm),
+		},
+		Reason: "revoked",
+		Target: &wirePeer{
+			PeerID:      removed.PeerID,
+			Name:        removed.Name,
+			Fingerprint: removed.Fingerprint,
+			Addrs:       append([]string(nil), removed.Addrs...),
+		},
+	}
+	_ = json.NewEncoder(stream).Encode(frame)
+}
+
+func (n *Node) handleRevocationNotice(stream network.Stream, frame swarmUpdateFrame) {
+	current, err := n.store.LoadSwarm(strings.TrimSpace(frame.Swarm.ID))
+	if err != nil {
+		return
+	}
+	current = normalizeSwarmMetadata(current)
+	ownerPeerID := swarmOwnerPeerID(current)
+	if ownerPeerID == "" || stream.Conn().RemotePeer().String() != ownerPeerID {
+		return
+	}
+	if frame.Target == nil || strings.TrimSpace(frame.Target.PeerID) != n.host.ID().String() {
+		return
+	}
+
+	actor, ok := trustedPeerByID(current.TrustedPeers, ownerPeerID)
+	if !ok {
+		actor = model.TrustedPeer{PeerID: ownerPeerID}
+	}
+	actor.Addrs = uniqueStrings(append(actor.Addrs, n.peerAddrs(ownerPeerID)...))
+	if actor.LastSeen.IsZero() {
+		actor.LastSeen = time.Now()
+	}
+
+	n.emit(Event{
+		Kind: EventSwarmRevoked,
+		Revocation: &SwarmRevocation{
+			SwarmID:   current.ID,
+			SwarmName: current.Name,
+			Version:   swarmVersion(model.Swarm{Version: frame.Swarm.Version}),
+			Actor:     actor,
+		},
+	})
+}
+
 func (n *Node) connectTrustedPeers(swarm model.Swarm) {
 	for _, trusted := range swarm.TrustedPeers {
 		if trusted.PeerID == n.host.ID().String() {
@@ -1859,7 +1952,9 @@ func sameSwarmSession(left, right model.Swarm) bool {
 		left.Name != right.Name ||
 		left.RoomKey != right.RoomKey ||
 		swarmOwnerPeerID(left) != swarmOwnerPeerID(right) ||
-		swarmVersion(left) != swarmVersion(right) {
+		swarmVersion(left) != swarmVersion(right) ||
+		left.Revoked != right.Revoked ||
+		!left.RevokedAt.Equal(right.RevokedAt) {
 		return false
 	}
 	leftPeers := sortedTrustedPeers(left.TrustedPeers)
@@ -1975,7 +2070,7 @@ func (n *Node) shouldSyncSwarmUpdate(swarmID, peerID string, version uint64) boo
 
 func normalizeSwarmUpdateReason(reason string) string {
 	switch strings.TrimSpace(reason) {
-	case "join", "revoke", "rotate", "sync":
+	case "join", "revoke", "revoked", "rotate", "sync":
 		return strings.TrimSpace(reason)
 	default:
 		return "sync"

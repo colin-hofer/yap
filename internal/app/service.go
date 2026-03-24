@@ -296,6 +296,9 @@ func (s *Service) OpenSwarm(ref string) error {
 		return err
 	}
 	swarm = normalizeSwarmMetadata(swarm)
+	if swarm.Revoked {
+		return fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
+	}
 	swarm.LastOpened = time.Now()
 	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 	if err := s.store.SaveSwarm(swarm); err != nil {
@@ -378,6 +381,9 @@ func (s *Service) RotateRoomKey(ref string) error {
 	if err != nil {
 		return err
 	}
+	if swarm.Revoked {
+		return fmt.Errorf("access to %s was revoked", swarm.Name)
+	}
 	updated, _, err := prepareSwarmRotation(swarm, s.node.Self(), "")
 	if err != nil {
 		return err
@@ -408,6 +414,9 @@ func (s *Service) RevokePeer(ref, peerID string) error {
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
 		return err
+	}
+	if swarm.Revoked {
+		return fmt.Errorf("access to %s was revoked", swarm.Name)
 	}
 	updated, removed, err := prepareSwarmRotation(swarm, s.node.Self(), peerID)
 	if err != nil {
@@ -440,6 +449,9 @@ func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
 		return model.Invite{}, err
 	}
 	swarm = normalizeSwarmMetadata(swarm)
+	if swarm.Revoked {
+		return model.Invite{}, fmt.Errorf("access to %s was revoked", swarm.Name)
+	}
 	if !swarmOwnedBy(swarm, s.identity.PeerID) {
 		return model.Invite{}, fmt.Errorf("only the room owner can invite new members")
 	}
@@ -471,6 +483,13 @@ func (s *Service) SendChat(body string) error {
 	s.mu.RUnlock()
 	if strings.TrimSpace(selectedID) == "" {
 		return fmt.Errorf("no swarm selected")
+	}
+	swarm, err := s.findSwarm(selectedID)
+	if err != nil {
+		return err
+	}
+	if swarm.Revoked {
+		return fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
 	}
 	return s.node.PublishChat(selectedID, body)
 }
@@ -546,6 +565,10 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 	case p2p.EventSwarmUpdate:
 		if event.SwarmUpdate != nil {
 			s.handleSwarmUpdate(*event.SwarmUpdate)
+		}
+	case p2p.EventSwarmRevoked:
+		if event.Revocation != nil {
+			s.handleSwarmRevocation(*event.Revocation)
 		}
 	}
 }
@@ -679,6 +702,8 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 
 func (s *Service) handleSwarmUpdate(update p2p.SwarmUpdate) {
 	swarm := normalizeSwarmMetadata(update.Swarm)
+	swarm.Revoked = false
+	swarm.RevokedAt = time.Time{}
 	if strings.TrimSpace(swarm.ID) == "" {
 		return
 	}
@@ -713,10 +738,46 @@ func (s *Service) handleSwarmUpdate(update p2p.SwarmUpdate) {
 	s.emitSync()
 }
 
+func (s *Service) handleSwarmRevocation(revocation p2p.SwarmRevocation) {
+	swarm, err := s.findSwarm(revocation.SwarmID)
+	if err != nil {
+		return
+	}
+	swarm = normalizeSwarmMetadata(swarm)
+	swarm.Revoked = true
+	swarm.RevokedAt = time.Now()
+	if revocation.Version > 0 {
+		swarm.Version = revocation.Version
+	}
+	if err := s.node.CloseSwarm(swarm.ID); err != nil {
+		s.emitToast(err.Error())
+	}
+	if err := s.store.SaveSwarm(swarm); err != nil {
+		s.emitToast(err.Error())
+		return
+	}
+
+	s.mu.Lock()
+	if s.selectedID == swarm.ID {
+		s.selectedID = ""
+	}
+	s.connected[swarm.ID] = false
+	s.presence[swarm.ID] = nil
+	s.replaceSwarmLocked(swarm)
+	s.mu.Unlock()
+
+	message := fmt.Sprintf("%s removed you from %s", displayName(revocation.Actor), swarm.Name)
+	s.appendLocalSystemEntry(swarm.ID, message+".")
+	s.emitToast(message)
+	s.emitSync()
+}
+
 func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 	switch result.Direction {
 	case "incoming":
 		swarm := normalizeSwarmMetadata(result.Swarm)
+		swarm.Revoked = false
+		swarm.RevokedAt = time.Time{}
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, result.Peer)
 		if err := s.store.SaveSwarm(swarm); err != nil {
@@ -735,6 +796,8 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		s.emitSync()
 	case "outgoing":
 		swarm := normalizeSwarmMetadata(result.Swarm)
+		swarm.Revoked = false
+		swarm.RevokedAt = time.Time{}
 		if swarm.OwnerPeerID == "" {
 			swarm.OwnerPeerID = result.Peer.PeerID
 		}

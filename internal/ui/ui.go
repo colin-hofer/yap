@@ -103,11 +103,11 @@ type modelUI struct {
 	emojiResults []emoji.Entry
 	emojiIdx     int
 
-	messages    viewport.Model
-	composer    textarea.Model
-	prompt      textinput.Model
-	modal       modalState
-	modalQueue  []modalState
+	messages      viewport.Model
+	composer      textarea.Model
+	prompt        textinput.Model
+	modal         modalState
+	modalQueue    []modalState
 	hasNewBelow   bool
 	newBelowCount int
 }
@@ -1185,7 +1185,11 @@ func (m *modelUI) renderSwarms() string {
 		lines = append(lines, "", label)
 
 		var metaParts []string
-		metaParts = append(metaParts, fmt.Sprintf("%d peers", len(swarm.Swarm.TrustedPeers)))
+		if swarm.Swarm.Revoked {
+			metaParts = append(metaParts, dangerStyle.Render("revoked"))
+		} else {
+			metaParts = append(metaParts, fmt.Sprintf("%d peers", len(swarm.Swarm.TrustedPeers)))
+		}
 		if swarm.Unread > 0 {
 			metaParts = append(metaParts, accentStyle.Render(fmt.Sprintf("%d unread", swarm.Unread)))
 		}
@@ -1394,7 +1398,9 @@ func (m *modelUI) renderChatSwarms() string {
 		current := swarm.Swarm.ID == currentID
 
 		dot := "●"
-		if !swarm.Connected {
+		if swarm.Swarm.Revoked {
+			dot = "×"
+		} else if !swarm.Connected {
 			dot = "○"
 		}
 		name := truncate(swarm.Swarm.Name, 16)
@@ -1738,6 +1744,9 @@ func (m *modelUI) chatFooterHelp() string {
 }
 
 func swarmDot(swarm app.SwarmSummary) string {
+	if swarm.Swarm.Revoked {
+		return lipgloss.NewStyle().Foreground(colorDanger).Render("× ")
+	}
 	if swarm.Connected {
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("● ")
 	}
@@ -1987,6 +1996,8 @@ func (m *modelUI) selectedSwarmSummary() *app.SwarmSummary {
 func (m *modelUI) swarmInfoMessage(swarm app.SwarmSummary) string {
 	status := "saved locally"
 	switch {
+	case swarm.Swarm.Revoked:
+		status = "access revoked"
 	case m.state.SelectedSwarm != nil && m.state.SelectedSwarm.ID == swarm.Swarm.ID:
 		status = m.connectionSummary()
 	case swarm.Connected:
