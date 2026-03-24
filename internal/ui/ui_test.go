@@ -180,6 +180,81 @@ func TestHandleHomeRenameOpensModal(t *testing.T) {
 	}
 }
 
+func TestHandleHomeInfoShowsSelectedSwarm(t *testing.T) {
+	m := &modelUI{
+		mode:  "home",
+		focus: "swarms",
+		state: app.State{
+			Identity: model.Identity{Name: "me", PeerID: "self"},
+			Swarms: []app.SwarmSummary{{
+				Swarm: model.Swarm{
+					ID:           "swarm-1",
+					Name:         "Alpha",
+					TrustedPeers: []model.TrustedPeer{{PeerID: "self", Name: "me", Fingerprint: "self-fp"}},
+				},
+			}},
+		},
+	}
+
+	modelOut, _ := m.handleHome(tea.KeyPressMsg{Code: 'v', Text: "v"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "info" {
+		t.Fatalf("modal.Kind = %q, want info", got.modal.Kind)
+	}
+	if !strings.Contains(got.modal.Message, "Alpha") {
+		t.Fatalf("modal.Message = %q, want swarm details", got.modal.Message)
+	}
+}
+
+func TestHandleHomeInfoShowsSelectedNearbyPeer(t *testing.T) {
+	m := &modelUI{
+		mode:  "home",
+		focus: "nearby",
+		state: app.State{
+			Identity: model.Identity{Name: "me", PeerID: "self"},
+			Nearby: []model.NearbyPeer{{
+				PeerID:      "peer-1",
+				Name:        "Peer",
+				Fingerprint: "peer-fp",
+			}},
+		},
+	}
+
+	modelOut, _ := m.handleHome(tea.KeyPressMsg{Code: 'v', Text: "v"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "info" {
+		t.Fatalf("modal.Kind = %q, want info", got.modal.Kind)
+	}
+	if !strings.Contains(got.modal.Message, "peer-fp") {
+		t.Fatalf("modal.Message = %q, want peer fingerprint", got.modal.Message)
+	}
+}
+
+func TestHandleHomeRotateShowsSelectedSwarm(t *testing.T) {
+	m := &modelUI{
+		mode:  "home",
+		focus: "swarms",
+		state: app.State{
+			Identity: model.Identity{Name: "me", PeerID: "self"},
+			Swarms: []app.SwarmSummary{{
+				Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha", OwnerPeerID: "self", Version: 1},
+			}},
+		},
+	}
+
+	modelOut, _ := m.handleHome(tea.KeyPressMsg{Code: 'R', Text: "R"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "rotate" {
+		t.Fatalf("modal.Kind = %q, want rotate", got.modal.Kind)
+	}
+	if got.modal.SwarmID != "swarm-1" {
+		t.Fatalf("modal.SwarmID = %q, want swarm-1", got.modal.SwarmID)
+	}
+}
+
 func TestHandleChatTabCompletesMentionBeforeChangingFocus(t *testing.T) {
 	composer := newTestComposer()
 	composer.SetValue("@pe")
@@ -228,6 +303,100 @@ func TestHandleChatTabCyclesFocusAcrossComposerPeersAndSwarms(t *testing.T) {
 	got = modelOut.(*modelUI)
 	if got.focus != "composer" {
 		t.Fatalf("focus after third tab = %q, want composer", got.focus)
+	}
+}
+
+func TestHandleChatDoesNotTreatVAsCommandWhileComposerFocused(t *testing.T) {
+	composer := newTestComposer()
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "composer",
+		state:    app.State{SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
+		composer: composer,
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'v', Text: "v"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "" {
+		t.Fatalf("modal.Kind = %q, want empty", got.modal.Kind)
+	}
+	if got.composer.Value() != "v" {
+		t.Fatalf("composer.Value() = %q, want %q", got.composer.Value(), "v")
+	}
+}
+
+func TestHandleChatInfoShowsCurrentSwarm(t *testing.T) {
+	m := &modelUI{
+		mode:  "chat",
+		focus: "peers",
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha", TrustedPeers: []model.TrustedPeer{{PeerID: "self", Name: "me", Fingerprint: "self-fp"}}},
+			Swarms:        []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha", TrustedPeers: []model.TrustedPeer{{PeerID: "self", Name: "me", Fingerprint: "self-fp"}}}}},
+		},
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'v', Text: "v"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "info" {
+		t.Fatalf("modal.Kind = %q, want info", got.modal.Kind)
+	}
+	if !strings.Contains(got.modal.Message, "Alpha") {
+		t.Fatalf("modal.Message = %q, want swarm details", got.modal.Message)
+	}
+}
+
+func TestHandleChatRevokeOpensModalForSelectedPeer(t *testing.T) {
+	m := &modelUI{
+		mode:    "chat",
+		focus:   "peers",
+		peerIdx: 1,
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha", OwnerPeerID: "self", Version: 2},
+			Presence: []model.Presence{
+				{PeerID: "self", Name: "me", State: "online"},
+				{PeerID: "peer-1", Name: "Peer", State: "online"},
+			},
+		},
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "revoke" {
+		t.Fatalf("modal.Kind = %q, want revoke", got.modal.Kind)
+	}
+	if got.modal.PeerID != "peer-1" {
+		t.Fatalf("modal.PeerID = %q, want peer-1", got.modal.PeerID)
+	}
+}
+
+func TestHandleChatRevokeRejectsSelfSelection(t *testing.T) {
+	m := &modelUI{
+		mode:    "chat",
+		focus:   "peers",
+		peerIdx: 0,
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Presence: []model.Presence{
+				{PeerID: "self", Name: "me", State: "online"},
+			},
+		},
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: 'x', Text: "x"})
+	got := modelOut.(*modelUI)
+
+	if got.modal.Kind != "" {
+		t.Fatalf("modal.Kind = %q, want empty", got.modal.Kind)
+	}
+	if got.status != "select another peer to revoke" {
+		t.Fatalf("status = %q", got.status)
 	}
 }
 
@@ -288,7 +457,24 @@ func TestConnectionSummaryReflectsPeerHealth(t *testing.T) {
 		},
 	}
 
-	if got := m.connectionSummary(); got != "◉ 2 online · 1 stale" {
+	if got := m.connectionSummary(); got != "◉ 1 online · 1 stale" {
+		t.Fatalf("connectionSummary() = %q", got)
+	}
+}
+
+func TestConnectionSummaryWaitsForPeersWhenOnlySelfIsPresent(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Swarms:        []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha"}}},
+			Presence: []model.Presence{
+				{PeerID: "self", State: "online"},
+			},
+		},
+	}
+
+	if got := m.connectionSummary(); got != "◎ waiting for peers" {
 		t.Fatalf("connectionSummary() = %q", got)
 	}
 }
@@ -385,14 +571,14 @@ func TestRenderTranscriptPreservesAndFitsASCIIArt(t *testing.T) {
 	}, "\n")
 	content := m.renderTranscript([]model.TranscriptEntry{
 		{ID: "msg-1", Kind: "chat", SenderPeerID: "self", SenderName: "A", Body: art, Local: true, SentAt: time.Unix(20, 0)},
-	}, 12)
+	}, 20)
 
 	if !strings.Contains(content, "**") {
 		t.Fatalf("renderTranscript() lost ascii art characters:\n%s", content)
 	}
 	for _, line := range strings.Split(content, "\n") {
-		if lipgloss.Width(line) > 12 {
-			t.Fatalf("line width = %d, want <= 12:\n%s", lipgloss.Width(line), content)
+		if lipgloss.Width(line) > 20 {
+			t.Fatalf("line width = %d, want <= 20:\n%s", lipgloss.Width(line), content)
 		}
 	}
 }
@@ -425,6 +611,97 @@ func TestApplyAppEventPreservesChatSidebarFocus(t *testing.T) {
 
 	if got, want := m.focus, "swarms"; got != want {
 		t.Fatalf("focus = %q, want %q", got, want)
+	}
+}
+
+func TestViewMinimumTerminalSize(t *testing.T) {
+	m := &modelUI{
+		width:  10,
+		height: 5,
+		mode:   "home",
+		state: app.State{
+			Identity: model.Identity{Name: "me", PeerID: "self"},
+		},
+		messages: viewport.New(),
+		composer: newTestComposer(),
+		prompt:   textinput.New(),
+	}
+
+	v := m.View()
+	if !strings.Contains(v.Body, "too small") {
+		t.Fatalf("View() should show 'too small' at tiny size, got:\n%s", v.Body)
+	}
+}
+
+func TestRenderTranscriptShowsDateSeparator(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+		},
+	}
+
+	day1 := time.Date(2025, 3, 15, 10, 0, 0, 0, time.UTC)
+	day2 := time.Date(2025, 3, 16, 9, 0, 0, 0, time.UTC)
+
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "msg-1", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "hello", SentAt: day1},
+		{ID: "msg-2", Kind: "chat", SenderPeerID: "peer-1", SenderName: "Peer", Body: "next day", SentAt: day2},
+	}, 80)
+
+	if !strings.Contains(content, "Mar 16") {
+		t.Fatalf("renderTranscript() missing date separator:\n%s", content)
+	}
+}
+
+func TestRenderTranscriptEmptyStateShowsWelcome(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+		},
+	}
+
+	content := m.renderTranscript(nil, 80)
+
+	if !strings.Contains(content, "Welcome to Alpha") {
+		t.Fatalf("renderTranscript() missing welcome message:\n%s", content)
+	}
+}
+
+func TestRelativeTime(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name string
+		time time.Time
+		want string
+	}{
+		{"just now", now.Add(-10 * time.Second), "now"},
+		{"minutes ago", now.Add(-5 * time.Minute), "5m"},
+		{"earlier today", now.Add(-3 * time.Hour), now.Add(-3 * time.Hour).Format("15:04")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := relativeTime(tt.time)
+			if got != tt.want {
+				t.Fatalf("relativeTime() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestoreHighlightedSwarmClampsToZeroOnEmpty(t *testing.T) {
+	m := &modelUI{
+		swarmIdx: 5,
+		state:    app.State{},
+	}
+
+	m.restoreHighlightedSwarm("")
+
+	if m.swarmIdx != 0 {
+		t.Fatalf("swarmIdx = %d, want 0", m.swarmIdx)
 	}
 }
 

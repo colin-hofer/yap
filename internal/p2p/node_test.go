@@ -10,6 +10,7 @@ import (
 	corecrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	yapcrypto "yap/internal/crypto"
 	"yap/internal/model"
 )
 
@@ -39,6 +40,85 @@ func TestListenAddrsSupportsExplicitQUIC(t *testing.T) {
 	}
 }
 
+func TestTopicNameDerivesFromRoomKey(t *testing.T) {
+	t.Parallel()
+
+	roomKey, err := yapcrypto.NewRoomKey()
+	if err != nil {
+		t.Fatalf("NewRoomKey() error = %v", err)
+	}
+	otherRoomKey, err := yapcrypto.NewRoomKey()
+	if err != nil {
+		t.Fatalf("NewRoomKey() error = %v", err)
+	}
+
+	first := topicName(roomKey)
+	if got := topicName(roomKey); got != first {
+		t.Fatalf("topicName(roomKey) = %q, want stable %q", got, first)
+	}
+	if first == topicName(otherRoomKey) {
+		t.Fatal("topicName() produced the same topic for different room keys")
+	}
+	if strings.Contains(first, roomKey) {
+		t.Fatalf("topicName(%q) leaked room key in %q", roomKey, first)
+	}
+}
+
+func TestNormalizeSwarmMetadataInfersOwnerAndVersion(t *testing.T) {
+	t.Parallel()
+
+	swarm := normalizeSwarmMetadata(model.Swarm{
+		ID:      "swarm-1",
+		Name:    "Alpha",
+		RoomKey: "room-key",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-b", Name: "B"},
+			{PeerID: "peer-a", Name: "A"},
+		},
+	})
+
+	if got, want := swarm.OwnerPeerID, "peer-b"; got != want {
+		t.Fatalf("OwnerPeerID = %q, want %q", got, want)
+	}
+	if got, want := swarm.Version, uint64(1); got != want {
+		t.Fatalf("Version = %d, want %d", got, want)
+	}
+	if got, want := swarm.TrustedPeers[0].PeerID, "peer-b"; got != want {
+		t.Fatalf("TrustedPeers[0].PeerID = %q, want %q", got, want)
+	}
+}
+
+func TestSameSwarmSessionIgnoresTrustedPeerOrder(t *testing.T) {
+	t.Parallel()
+
+	left := model.Swarm{
+		ID:          "swarm-1",
+		Name:        "Alpha",
+		RoomKey:     "room-key",
+		OwnerPeerID: "peer-a",
+		Version:     3,
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-a", Name: "A"},
+			{PeerID: "peer-b", Name: "B"},
+		},
+	}
+	right := model.Swarm{
+		ID:          "swarm-1",
+		Name:        "Alpha",
+		RoomKey:     "room-key",
+		OwnerPeerID: "peer-a",
+		Version:     3,
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-b", Name: "B"},
+			{PeerID: "peer-a", Name: "A"},
+		},
+	}
+
+	if !sameSwarmSession(left, right) {
+		t.Fatal("sameSwarmSession() = false, want true for identical membership in different order")
+	}
+}
+
 func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 	sentAt := time.Unix(42, 0)
 	env := envelope{
@@ -46,6 +126,7 @@ func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 		Kind:       "chat",
 		SenderName: "Peer",
 		SentAt:     sentAt,
+		Signature:  "sig-1",
 	}
 
 	entry := transcriptEntryFromEnvelope("swarm-1", "peer-1", env, "hello", true)
@@ -58,6 +139,9 @@ func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 	}
 	if !entry.Local {
 		t.Fatal("entry.Local = false, want true")
+	}
+	if got, want := entry.Signature, "sig-1"; got != want {
+		t.Fatalf("entry.Signature = %q, want %q", got, want)
 	}
 }
 
@@ -250,6 +334,66 @@ func TestResolvedPeerNamePrefersTrustedNameOverClaimed(t *testing.T) {
 
 	if got, want := resolvedPeerName(swarm, author, "Claimed Name"), "Trusted Name"; got != want {
 		t.Fatalf("resolvedPeerName() = %q, want %q", got, want)
+	}
+}
+
+func TestVerifiedTranscriptEntriesRejectsForgedSender(t *testing.T) {
+	t.Parallel()
+
+	signer, publicKey, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	authorPeer, err := peer.IDFromPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+	_, otherPublicKey, err := corecrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key() error = %v", err)
+	}
+	otherPeer, err := peer.IDFromPublicKey(otherPublicKey)
+	if err != nil {
+		t.Fatalf("IDFromPublicKey() error = %v", err)
+	}
+
+	signingNode := &Node{signer: signer}
+	entry := model.TranscriptEntry{
+		ID:           "msg-1",
+		SwarmID:      "swarm-1",
+		Kind:         "chat",
+		SenderPeerID: authorPeer.String(),
+		SenderName:   "Author",
+		Body:         "hello",
+		SentAt:       time.Unix(20, 0),
+	}
+	signature, err := signingNode.signTranscriptEntry(entry)
+	if err != nil {
+		t.Fatalf("signTranscriptEntry() error = %v", err)
+	}
+
+	verifyNode := &Node{}
+	swarm := model.Swarm{
+		ID:   "swarm-1",
+		Name: "Alpha",
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: authorPeer.String(), Name: "Author"},
+			{PeerID: otherPeer.String(), Name: "Other"},
+		},
+	}
+	entries := verifyNode.verifiedTranscriptEntries(swarm, []wireTranscriptEntry{{
+		ID:           entry.ID,
+		SwarmID:      entry.SwarmID,
+		Kind:         entry.Kind,
+		SenderPeerID: otherPeer.String(),
+		SenderName:   entry.SenderName,
+		Body:         entry.Body,
+		SentAt:       entry.SentAt,
+		Signature:    signature,
+	}}, "self")
+
+	if got := len(entries); got != 0 {
+		t.Fatalf("len(entries) = %d, want 0", got)
 	}
 }
 

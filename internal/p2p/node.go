@@ -2,6 +2,9 @@ package p2p
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,11 +35,13 @@ const (
 	cardProtocolID       = protocol.ID("/yap/card/2")
 	pairProtocolID       = protocol.ID("/yap/pair/2")
 	historyProtocolID    = protocol.ID("/yap/history/2")
+	swarmProtocolID      = protocol.ID("/yap/swarm/1")
 	heartbeatEvery       = 15 * time.Second
 	staleAfter           = 45 * time.Second
 	offlineAfter         = 90 * time.Second
 	reconnectEvery       = 20 * time.Second
 	historyCooldown      = 1 * time.Minute
+	swarmSyncCooldown    = 30 * time.Second
 	inviteTTL            = 5 * time.Minute
 	defaultInviteUse     = 5
 	nearbyRefreshEvery   = 10 * time.Second
@@ -67,6 +72,7 @@ const (
 	EventTranscript     EventKind = "transcript"
 	EventHistory        EventKind = "history"
 	EventPresence       EventKind = "presence"
+	EventSwarmUpdate    EventKind = "swarm_update"
 )
 
 // Event describes a state change from the node.
@@ -78,6 +84,7 @@ type Event struct {
 	NearbyPeers []model.NearbyPeer
 	Approval    *Approval
 	Pair        *PairResult
+	SwarmUpdate *SwarmUpdate
 	Entry       *model.TranscriptEntry
 	Entries     []model.TranscriptEntry
 	Presence    []model.Presence
@@ -99,12 +106,21 @@ type PairResult struct {
 	Peer      model.TrustedPeer
 }
 
+// SwarmUpdate is emitted when the owner publishes a new roster or room key.
+type SwarmUpdate struct {
+	Swarm  model.Swarm
+	Reason string
+	Actor  model.TrustedPeer
+	Target *model.TrustedPeer
+}
+
 // Node hosts discovery, pairing, pubsub, and room presence.
 type Node struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	host     host.Host
 	pubsub   *pubsub.PubSub
+	signer   corecrypto.PrivKey
 	identity model.Identity
 	store    *store.Store
 
@@ -120,6 +136,7 @@ type Node struct {
 	seen             map[string]struct{}
 	seenOrder        []string
 	historySync      map[string]time.Time
+	swarmSync        map[string]swarmSyncRecord
 	typingSent       map[string]time.Time
 	typingState      map[string]bool
 }
@@ -142,6 +159,11 @@ type activeSwarm struct {
 	Context  context.Context
 	Cancel   context.CancelFunc
 	Presence map[string]*presenceRecord
+}
+
+type swarmSyncRecord struct {
+	Version uint64
+	SentAt  time.Time
 }
 
 type presenceRecord struct {
@@ -184,9 +206,18 @@ type pairSuccess struct {
 }
 
 type wireSwarm struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	RoomKey string `json:"room_key"`
+	ID           string     `json:"id"`
+	Name         string     `json:"name"`
+	RoomKey      string     `json:"room_key"`
+	OwnerPeerID  string     `json:"owner_peer_id,omitempty"`
+	Version      uint64     `json:"version,omitempty"`
+	TrustedPeers []wirePeer `json:"trusted_peers,omitempty"`
+}
+
+type swarmUpdateFrame struct {
+	Swarm  wireSwarm `json:"swarm"`
+	Reason string    `json:"reason,omitempty"`
+	Target *wirePeer `json:"target,omitempty"`
 }
 
 type envelope struct {
@@ -194,6 +225,7 @@ type envelope struct {
 	Kind       string    `json:"kind"`
 	SenderName string    `json:"sender_name"`
 	SentAt     time.Time `json:"sent_at"`
+	Signature  string    `json:"signature,omitempty"`
 	Nonce      string    `json:"nonce"`
 	Ciphertext string    `json:"ciphertext"`
 }
@@ -245,6 +277,7 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		cancel:           cancel,
 		host:             h,
 		pubsub:           ps,
+		signer:           privateKey,
 		identity:         identity,
 		store:            st,
 		events:           make(chan Event, 256),
@@ -256,6 +289,7 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		seen:             make(map[string]struct{}),
 		seenOrder:        make([]string, 0, maxSeenIDs),
 		historySync:      make(map[string]time.Time),
+		swarmSync:        make(map[string]swarmSyncRecord),
 		typingSent:       make(map[string]time.Time),
 		typingState:      make(map[string]bool),
 	}
@@ -263,6 +297,7 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 	h.SetStreamHandler(cardProtocolID, node.handleCardStream)
 	h.SetStreamHandler(pairProtocolID, node.handlePairStream)
 	h.SetStreamHandler(historyProtocolID, node.handleHistoryStream)
+	h.SetStreamHandler(swarmProtocolID, node.handleSwarmStream)
 
 	service := mdns.NewMdnsService(h, mdnsServiceName, &discoveryNotifee{node: node})
 	if err := service.Start(); err != nil {
@@ -302,6 +337,10 @@ func (n *Node) NearbySnapshot() []model.NearbyPeer {
 
 // CreateInvite registers a short-lived invite for a swarm.
 func (n *Node) CreateInvite(swarm model.Swarm) (model.Invite, error) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if !swarmOwnedBy(swarm, n.host.ID().String()) {
+		return model.Invite{}, fmt.Errorf("only the room owner can invite new members")
+	}
 	code, err := yapcrypto.NewInviteCode()
 	if err != nil {
 		return model.Invite{}, err
@@ -367,6 +406,7 @@ func (n *Node) PairWithPeer(peerID, code string, autoOpen bool) error {
 
 // OpenSwarm joins the room topic and begins presence/publication loops.
 func (n *Node) OpenSwarm(swarm model.Swarm) error {
+	swarm = normalizeSwarmMetadata(swarm)
 	if active := n.currentSwarm(swarm.ID); active != nil {
 		if sameSwarmSession(active.Swarm, swarm) {
 			return nil
@@ -375,7 +415,7 @@ func (n *Node) OpenSwarm(swarm model.Swarm) error {
 			return err
 		}
 	}
-	topicName := topicName(swarm.ID)
+	topicName := topicName(swarm.RoomKey)
 	topic, err := n.pubsub.Join(topicName)
 	if err != nil {
 		return fmt.Errorf("join topic %s: %w", topicName, err)
@@ -762,6 +802,92 @@ func (n *Node) handleCardStream(stream network.Stream) {
 	_ = json.NewEncoder(stream).Encode(toWirePeer(n.selfPeer()))
 }
 
+// BroadcastSwarmUpdate pushes the current swarm roster and room key directly to
+// the remaining trusted peers. Only the swarm owner is allowed to publish
+// updates that other peers will accept.
+func (n *Node) BroadcastSwarmUpdate(swarm model.Swarm, reason string, target *model.TrustedPeer) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if !swarmOwnedBy(swarm, n.host.ID().String()) {
+		return
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID == n.host.ID().String() {
+			continue
+		}
+		trusted := trusted
+		var targetCopy *model.TrustedPeer
+		if target != nil {
+			copy := *target
+			targetCopy = &copy
+		}
+		go n.sendSwarmUpdate(swarm, trusted, normalizeSwarmUpdateReason(reason), targetCopy, false)
+	}
+}
+
+func (n *Node) handleSwarmStream(stream network.Stream) {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(historyStreamTimeout))
+
+	var frame swarmUpdateFrame
+	if err := json.NewDecoder(stream).Decode(&frame); err != nil {
+		return
+	}
+
+	updated, err := validatedSwarm(frame.Swarm)
+	if err != nil {
+		return
+	}
+
+	current, err := n.store.LoadSwarm(updated.ID)
+	if err != nil {
+		return
+	}
+	current = normalizeSwarmMetadata(current)
+	updated = normalizeSwarmMetadata(updated)
+
+	ownerPeerID := swarmOwnerPeerID(current)
+	if ownerPeerID == "" || stream.Conn().RemotePeer().String() != ownerPeerID {
+		return
+	}
+	if swarmOwnerPeerID(updated) != ownerPeerID {
+		return
+	}
+	if swarmVersion(updated) <= swarmVersion(current) {
+		return
+	}
+	if !swarmHasTrustedPeerID(updated, n.host.ID().String()) {
+		return
+	}
+	if !swarmHasTrustedPeerID(updated, ownerPeerID) {
+		return
+	}
+
+	actor, ok := trustedPeerByID(updated.TrustedPeers, ownerPeerID)
+	if !ok {
+		actor, _ = trustedPeerByID(current.TrustedPeers, ownerPeerID)
+	}
+	actor.Addrs = uniqueStrings(append(actor.Addrs, n.peerAddrs(ownerPeerID)...))
+	if actor.LastSeen.IsZero() {
+		actor.LastSeen = time.Now()
+	}
+
+	var target *model.TrustedPeer
+	if frame.Target != nil {
+		candidate := trustedPeerFromWire(*frame.Target)
+		target = &candidate
+	}
+
+	n.emit(Event{
+		Kind: EventSwarmUpdate,
+		SwarmUpdate: &SwarmUpdate{
+			Swarm:  updated,
+			Reason: normalizeSwarmUpdateReason(frame.Reason),
+			Actor:  actor,
+			Target: target,
+		},
+	})
+}
+
 func (n *Node) handlePairStream(stream network.Stream) {
 	defer stream.Close()
 	_ = stream.SetDeadline(time.Now().Add(pairStreamTimeout))
@@ -784,6 +910,11 @@ func (n *Node) handlePairStream(stream network.Stream) {
 		_ = json.NewEncoder(stream).Encode(pairOffer{Stage: "rejected", Message: "invite not found or expired"})
 		return
 	}
+	swarm := n.currentInviteSwarm(invite)
+	if !swarmOwnedBy(swarm, n.host.ID().String()) {
+		_ = json.NewEncoder(stream).Encode(pairOffer{Stage: "rejected", Message: "only the room owner can invite new members"})
+		return
+	}
 
 	requester, err := verifiedTrustedPeer(stream.Conn(), request.Requester)
 	if err != nil {
@@ -799,7 +930,7 @@ func (n *Node) handlePairStream(stream network.Stream) {
 			ID:        approvalID,
 			Direction: "incoming",
 			Peer:      requester,
-			SwarmName: invite.Swarm.Name,
+			SwarmName: swarm.Name,
 		},
 	})
 
@@ -813,7 +944,7 @@ func (n *Node) handlePairStream(stream network.Stream) {
 	offer := pairOffer{
 		Stage:     "offer",
 		Responder: toWirePeer(n.selfPeer()),
-		SwarmName: invite.Swarm.Name,
+		SwarmName: swarm.Name,
 	}
 	if err := json.NewEncoder(stream).Encode(offer); err != nil {
 		n.bumpInviteUse(invite.Invite.Code, false)
@@ -830,14 +961,17 @@ func (n *Node) handlePairStream(stream network.Stream) {
 		return
 	}
 
+	alreadyTrusted := swarmHasTrustedPeerID(swarm, requester.PeerID)
+	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, requester)
+	if !alreadyTrusted {
+		swarm.Version = nextSwarmVersion(swarm)
+	}
+	swarm = normalizeSwarmMetadata(swarm)
+
 	success := pairSuccess{
 		Stage: "success",
-		Swarm: wireSwarm{
-			ID:      invite.Swarm.ID,
-			Name:    invite.Swarm.Name,
-			RoomKey: invite.Swarm.RoomKey,
-		},
-		Peer: toWirePeer(n.selfPeer()),
+		Swarm: toWireSwarm(swarm),
+		Peer:  toWirePeer(n.selfPeer()),
 	}
 	if err := json.NewEncoder(stream).Encode(success); err != nil {
 		n.bumpInviteUse(invite.Invite.Code, false)
@@ -849,7 +983,7 @@ func (n *Node) handlePairStream(stream network.Stream) {
 		Kind: EventPairComplete,
 		Pair: &PairResult{
 			Direction: "incoming",
-			Swarm:     invite.Swarm,
+			Swarm:     swarm,
 			Peer:      requester,
 		},
 	})
@@ -936,7 +1070,12 @@ func (n *Node) runOutgoingPair(peerID peer.ID, code string, autoOpen bool) {
 		n.emitSystem(err.Error())
 		return
 	}
-	swarm.TrustedPeers = append(swarm.TrustedPeers, verifiedPeer)
+	if swarm.OwnerPeerID == "" {
+		swarm.OwnerPeerID = verifiedPeer.PeerID
+	}
+	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, verifiedPeer)
+	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, n.selfPeer())
+	swarm = normalizeSwarmMetadata(swarm)
 	n.emit(Event{
 		Kind: EventPairComplete,
 		Pair: &PairResult{
@@ -979,6 +1118,9 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 		sentAt := clampEventTime(env.SentAt)
 		senderPeerID := author.String()
 		senderFingerprint := n.peerFingerprint(author)
+		if strings.TrimSpace(env.Signature) != "" && !n.verifyEnvelopeSignature(active.Swarm.ID, author, env, payload) {
+			continue
+		}
 		previousName, senderName := n.syncTrustedPeerIdentity(active, author, env.SenderName, senderFingerprint, sentAt)
 
 		switch env.Kind {
@@ -1102,6 +1244,7 @@ func (n *Node) reconnectLoop(active *activeSwarm) {
 		case <-ticker.C:
 			n.connectTrustedPeers(active.Swarm)
 			go n.syncSwarm(active)
+			go n.syncSwarmUpdates(active.Swarm)
 		}
 	}
 }
@@ -1149,11 +1292,17 @@ func (n *Node) newEnvelope(active *activeSwarm, kind string, payload envelopeBod
 	if sentAt.IsZero() {
 		sentAt = time.Now()
 	}
+	senderName := sanitizeDisplayName(n.identity.Name)
+	signature, err := n.signEnvelope(active.Swarm.ID, id, kind, n.host.ID().String(), senderName, payload, sentAt)
+	if err != nil {
+		return envelope{}, err
+	}
 	return envelope{
 		ID:         id,
 		Kind:       kind,
-		SenderName: sanitizeDisplayName(n.identity.Name),
+		SenderName: senderName,
 		SentAt:     sentAt,
+		Signature:  signature,
 		Nonce:      nonce,
 		Ciphertext: ciphertext,
 	}, nil
@@ -1180,6 +1329,7 @@ func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelo
 		SenderName:   env.SenderName,
 		Body:         body,
 		SentAt:       env.SentAt,
+		Signature:    strings.TrimSpace(env.Signature),
 		Local:        local,
 	}
 }
@@ -1202,6 +1352,61 @@ func (n *Node) syncTrustedPeerIdentity(active *activeSwarm, author peer.ID, clai
 	})
 	currentName := resolvedPeerName(active.Swarm, author, claimedName)
 	return previousName, currentName
+}
+
+func (n *Node) syncSwarmUpdates(swarm model.Swarm) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if !swarmOwnedBy(swarm, n.host.ID().String()) {
+		return
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID == n.host.ID().String() {
+			continue
+		}
+		trusted := trusted
+		go n.sendSwarmUpdate(swarm, trusted, "sync", nil, true)
+	}
+}
+
+func (n *Node) sendSwarmUpdate(swarm model.Swarm, trusted model.TrustedPeer, reason string, target *model.TrustedPeer, obeyCooldown bool) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if strings.TrimSpace(trusted.PeerID) == "" || trusted.PeerID == n.host.ID().String() {
+		return
+	}
+	if obeyCooldown && !n.shouldSyncSwarmUpdate(swarm.ID, trusted.PeerID, swarmVersion(swarm)) {
+		return
+	}
+
+	peerID, err := peer.Decode(trusted.PeerID)
+	if err != nil {
+		return
+	}
+	n.addTrustedPeerAddrs(trusted)
+
+	ctx, cancel := context.WithTimeout(n.ctx, historyStreamTimeout)
+	defer cancel()
+
+	stream, err := n.host.NewStream(ctx, peerID, swarmProtocolID)
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(historyStreamTimeout))
+
+	frame := swarmUpdateFrame{
+		Swarm:  toWireSwarm(swarm),
+		Reason: normalizeSwarmUpdateReason(reason),
+	}
+	if target != nil {
+		copy := *target
+		frame.Target = &wirePeer{
+			PeerID:      copy.PeerID,
+			Name:        copy.Name,
+			Fingerprint: copy.Fingerprint,
+			Addrs:       append([]string(nil), copy.Addrs...),
+		}
+	}
+	_ = json.NewEncoder(stream).Encode(frame)
 }
 
 func (n *Node) connectTrustedPeers(swarm model.Swarm) {
@@ -1502,11 +1707,26 @@ func waitForDecision(ctx context.Context, ch <-chan bool) (bool, bool) {
 	}
 }
 
+func (n *Node) currentInviteSwarm(invite *activeInvite) model.Swarm {
+	if invite == nil {
+		return model.Swarm{}
+	}
+	if n != nil && n.store != nil && strings.TrimSpace(invite.Invite.SwarmID) != "" {
+		if swarm, err := n.store.LoadSwarm(invite.Invite.SwarmID); err == nil {
+			return normalizeSwarmMetadata(swarm)
+		}
+	}
+	return normalizeSwarmMetadata(invite.Swarm)
+}
+
 func validatedSwarm(raw wireSwarm) (model.Swarm, error) {
 	swarm := model.Swarm{
-		ID:      strings.TrimSpace(raw.ID),
-		Name:    sanitizeDisplayName(raw.Name),
-		RoomKey: strings.TrimSpace(raw.RoomKey),
+		ID:           strings.TrimSpace(raw.ID),
+		Name:         sanitizeDisplayName(raw.Name),
+		RoomKey:      strings.TrimSpace(raw.RoomKey),
+		OwnerPeerID:  strings.TrimSpace(raw.OwnerPeerID),
+		Version:      raw.Version,
+		TrustedPeers: make([]model.TrustedPeer, 0, len(raw.TrustedPeers)),
 	}
 	if swarm.ID == "" {
 		return model.Swarm{}, fmt.Errorf("invalid swarm id")
@@ -1519,6 +1739,13 @@ func validatedSwarm(raw wireSwarm) (model.Swarm, error) {
 	}
 	if _, _, err := yapcrypto.Encrypt(swarm.RoomKey, []byte("{}")); err != nil {
 		return model.Swarm{}, fmt.Errorf("invalid room key")
+	}
+	for _, rawPeer := range raw.TrustedPeers {
+		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, trustedPeerFromWire(rawPeer))
+	}
+	swarm = normalizeSwarmMetadata(swarm)
+	if ownerPeerID := swarmOwnerPeerID(swarm); ownerPeerID != "" && !swarmHasTrustedPeerID(swarm, ownerPeerID) {
+		return model.Swarm{}, fmt.Errorf("invalid swarm owner")
 	}
 	return swarm, nil
 }
@@ -1576,6 +1803,31 @@ func toWirePeer(peerInfo model.TrustedPeer) wirePeer {
 	}
 }
 
+func trustedPeerFromWire(raw wirePeer) model.TrustedPeer {
+	return model.TrustedPeer{
+		PeerID:      strings.TrimSpace(raw.PeerID),
+		Name:        sanitizeDisplayName(raw.Name),
+		Fingerprint: strings.TrimSpace(raw.Fingerprint),
+		Addrs:       sanitizePeerAddrs(raw.Addrs),
+	}
+}
+
+func toWireSwarm(swarm model.Swarm) wireSwarm {
+	swarm = normalizeSwarmMetadata(swarm)
+	out := wireSwarm{
+		ID:          swarm.ID,
+		Name:        swarm.Name,
+		RoomKey:     swarm.RoomKey,
+		OwnerPeerID: swarmOwnerPeerID(swarm),
+		Version:     swarmVersion(swarm),
+	}
+	out.TrustedPeers = make([]wirePeer, 0, len(swarm.TrustedPeers))
+	for _, trusted := range swarm.TrustedPeers {
+		out.TrustedPeers = append(out.TrustedPeers, toWirePeer(trusted))
+	}
+	return out
+}
+
 func mergeTrustedPeer(peers []model.TrustedPeer, peerInfo model.TrustedPeer) []model.TrustedPeer {
 	for i, existing := range peers {
 		if existing.PeerID != peerInfo.PeerID {
@@ -1601,15 +1853,23 @@ func mergeTrustedPeer(peers []model.TrustedPeer, peerInfo model.TrustedPeer) []m
 }
 
 func sameSwarmSession(left, right model.Swarm) bool {
-	if left.ID != right.ID || left.Name != right.Name || left.RoomKey != right.RoomKey {
+	left = normalizeSwarmMetadata(left)
+	right = normalizeSwarmMetadata(right)
+	if left.ID != right.ID ||
+		left.Name != right.Name ||
+		left.RoomKey != right.RoomKey ||
+		swarmOwnerPeerID(left) != swarmOwnerPeerID(right) ||
+		swarmVersion(left) != swarmVersion(right) {
 		return false
 	}
-	if len(left.TrustedPeers) != len(right.TrustedPeers) {
+	leftPeers := sortedTrustedPeers(left.TrustedPeers)
+	rightPeers := sortedTrustedPeers(right.TrustedPeers)
+	if len(leftPeers) != len(rightPeers) {
 		return false
 	}
-	for i := range left.TrustedPeers {
-		l := left.TrustedPeers[i]
-		r := right.TrustedPeers[i]
+	for i := range leftPeers {
+		l := leftPeers[i]
+		r := rightPeers[i]
 		if l.PeerID != r.PeerID ||
 			l.Name != r.Name ||
 			l.Fingerprint != r.Fingerprint ||
@@ -1619,6 +1879,107 @@ func sameSwarmSession(left, right model.Swarm) bool {
 		}
 	}
 	return true
+}
+
+func sortedTrustedPeers(peers []model.TrustedPeer) []model.TrustedPeer {
+	out := append([]model.TrustedPeer(nil), peers...)
+	for i := range out {
+		out[i].Addrs = sanitizePeerAddrs(out[i].Addrs)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PeerID == out[j].PeerID {
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		}
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+func normalizeSwarmMetadata(swarm model.Swarm) model.Swarm {
+	swarm.OwnerPeerID = swarmOwnerPeerID(swarm)
+	if swarm.Version == 0 {
+		swarm.Version = 1
+	}
+	if owner := swarm.OwnerPeerID; owner != "" && len(swarm.TrustedPeers) > 0 {
+		reordered := make([]model.TrustedPeer, 0, len(swarm.TrustedPeers))
+		if ownerPeer, ok := trustedPeerByID(swarm.TrustedPeers, owner); ok {
+			reordered = append(reordered, ownerPeer)
+		}
+		others := make([]model.TrustedPeer, 0, len(swarm.TrustedPeers))
+		for _, trusted := range swarm.TrustedPeers {
+			if trusted.PeerID == owner {
+				continue
+			}
+			others = append(others, trusted)
+		}
+		sort.Slice(others, func(i, j int) bool {
+			return others[i].PeerID < others[j].PeerID
+		})
+		swarm.TrustedPeers = append(reordered, others...)
+	}
+	return swarm
+}
+
+func swarmOwnerPeerID(swarm model.Swarm) string {
+	if ownerPeerID := strings.TrimSpace(swarm.OwnerPeerID); ownerPeerID != "" {
+		return ownerPeerID
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if peerID := strings.TrimSpace(trusted.PeerID); peerID != "" {
+			return peerID
+		}
+	}
+	return ""
+}
+
+func swarmVersion(swarm model.Swarm) uint64 {
+	if swarm.Version == 0 {
+		return 1
+	}
+	return swarm.Version
+}
+
+func nextSwarmVersion(swarm model.Swarm) uint64 {
+	return swarmVersion(swarm) + 1
+}
+
+func swarmOwnedBy(swarm model.Swarm, peerID string) bool {
+	peerID = strings.TrimSpace(peerID)
+	return peerID != "" && swarmOwnerPeerID(swarm) == peerID
+}
+
+func trustedPeerByID(peers []model.TrustedPeer, peerID string) (model.TrustedPeer, bool) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return model.TrustedPeer{}, false
+	}
+	for _, trusted := range peers {
+		if trusted.PeerID == peerID {
+			return trusted, true
+		}
+	}
+	return model.TrustedPeer{}, false
+}
+
+func (n *Node) shouldSyncSwarmUpdate(swarmID, peerID string, version uint64) bool {
+	key := swarmID + "/" + peerID
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	last, ok := n.swarmSync[key]
+	if ok && last.Version == version && time.Since(last.SentAt) < swarmSyncCooldown {
+		return false
+	}
+	n.swarmSync[key] = swarmSyncRecord{Version: version, SentAt: time.Now()}
+	return true
+}
+
+func normalizeSwarmUpdateReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case "join", "revoke", "rotate", "sync":
+		return strings.TrimSpace(reason)
+	default:
+		return "sync"
+	}
 }
 
 func sameStrings(left, right []string) bool {
@@ -1671,8 +2032,13 @@ func nearbyLabel(peerInfo model.NearbyPeer) string {
 	return peerInfo.PeerID
 }
 
-func topicName(swarmID string) string {
-	return "yap/swarm/" + swarmID + "/v2"
+func topicName(roomKey string) string {
+	keyMaterial, err := base64.StdEncoding.DecodeString(strings.TrimSpace(roomKey))
+	if err != nil || len(keyMaterial) == 0 {
+		keyMaterial = []byte(strings.TrimSpace(roomKey))
+	}
+	sum := sha256.Sum256(append([]byte("yap-topic-v3:"), keyMaterial...))
+	return "yap/swarm/" + hex.EncodeToString(sum[:]) + "/v3"
 }
 
 func listenAddrs() []string {
@@ -1836,6 +2202,148 @@ func (n *Node) peerAddrs(peerID string) []string {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+type signedTranscriptEnvelope struct {
+	SwarmID         string `json:"swarm_id"`
+	ID              string `json:"id"`
+	Kind            string `json:"kind"`
+	SenderPeerID    string `json:"sender_peer_id"`
+	SenderName      string `json:"sender_name"`
+	Body            string `json:"body,omitempty"`
+	Typing          *bool  `json:"typing,omitempty"`
+	SentAtUnixMilli int64  `json:"sent_at_unix_milli"`
+}
+
+func (n *Node) signEnvelope(swarmID, id, kind, senderPeerID, senderName string, payload envelopeBody, sentAt time.Time) (string, error) {
+	if n.signer == nil {
+		return "", fmt.Errorf("missing signer")
+	}
+	data, err := json.Marshal(transcriptSignaturePayload(swarmID, id, kind, senderPeerID, senderName, payload.Body, payload.Typing, sentAt))
+	if err != nil {
+		return "", fmt.Errorf("encode envelope signature payload: %w", err)
+	}
+	signature, err := n.signer.Sign(data)
+	if err != nil {
+		return "", fmt.Errorf("sign envelope: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(signature), nil
+}
+
+func (n *Node) signTranscriptEntry(entry model.TranscriptEntry) (string, error) {
+	if n.signer == nil {
+		return "", fmt.Errorf("missing signer")
+	}
+	data, err := json.Marshal(transcriptSignaturePayload(
+		entry.SwarmID,
+		entry.ID,
+		entry.Kind,
+		entry.SenderPeerID,
+		entry.SenderName,
+		entry.Body,
+		nil,
+		entry.SentAt,
+	))
+	if err != nil {
+		return "", fmt.Errorf("encode transcript signature payload: %w", err)
+	}
+	signature, err := n.signer.Sign(data)
+	if err != nil {
+		return "", fmt.Errorf("sign transcript entry: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(signature), nil
+}
+
+func (n *Node) verifyEnvelopeSignature(swarmID string, author peer.ID, env envelope, payload envelopeBody) bool {
+	return n.verifyTranscriptSignature(
+		author.String(),
+		transcriptSignaturePayload(
+			swarmID,
+			env.ID,
+			env.Kind,
+			author.String(),
+			env.SenderName,
+			payload.Body,
+			payload.Typing,
+			env.SentAt,
+		),
+		env.Signature,
+	)
+}
+
+func (n *Node) verifyTranscriptEntrySignature(entry model.TranscriptEntry) bool {
+	return n.verifyTranscriptSignature(
+		entry.SenderPeerID,
+		transcriptSignaturePayload(
+			entry.SwarmID,
+			entry.ID,
+			entry.Kind,
+			entry.SenderPeerID,
+			entry.SenderName,
+			entry.Body,
+			nil,
+			entry.SentAt,
+		),
+		entry.Signature,
+	)
+}
+
+func (n *Node) verifyTranscriptSignature(senderPeerID string, payload signedTranscriptEnvelope, signatureBase64 string) bool {
+	signatureBase64 = strings.TrimSpace(signatureBase64)
+	if senderPeerID == "" || signatureBase64 == "" {
+		return false
+	}
+	publicKey := n.publicKeyForPeer(senderPeerID)
+	if publicKey == nil {
+		return false
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	signature, err := base64.StdEncoding.DecodeString(signatureBase64)
+	if err != nil {
+		return false
+	}
+	ok, err := publicKey.Verify(data, signature)
+	return err == nil && ok
+}
+
+func (n *Node) publicKeyForPeer(peerID string) corecrypto.PubKey {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return nil
+	}
+	decoded, err := peer.Decode(peerID)
+	if err != nil {
+		return nil
+	}
+	if n.host != nil {
+		if n.host.ID() == decoded && n.signer != nil {
+			return n.signer.GetPublic()
+		}
+		if key := n.host.Peerstore().PubKey(decoded); key != nil {
+			return key
+		}
+	}
+	key, err := decoded.ExtractPublicKey()
+	if err != nil {
+		return nil
+	}
+	return key
+}
+
+func transcriptSignaturePayload(swarmID, id, kind, senderPeerID, senderName, body string, typing *bool, sentAt time.Time) signedTranscriptEnvelope {
+	return signedTranscriptEnvelope{
+		SwarmID:         strings.TrimSpace(swarmID),
+		ID:              strings.TrimSpace(id),
+		Kind:            strings.TrimSpace(kind),
+		SenderPeerID:    strings.TrimSpace(senderPeerID),
+		SenderName:      sanitizeDisplayName(senderName),
+		Body:            body,
+		Typing:          typing,
+		SentAtUnixMilli: sentAt.UTC().UnixMilli(),
+	}
 }
 
 type discoveryNotifee struct {

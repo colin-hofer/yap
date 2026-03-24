@@ -40,6 +40,7 @@ var (
 	colorSelBg   = lipgloss.Color("#1E3040")
 	colorCodeBg  = lipgloss.Color("#1A2530")
 	colorCodeFg  = lipgloss.Color("#C8D8E8")
+	colorDim     = lipgloss.Color("#0D1117")
 
 	panelStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder).Padding(1, 2)
 	focusedPanelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorFocus).Padding(1, 2)
@@ -87,6 +88,7 @@ type modelUI struct {
 	focus     string
 	swarmIdx  int
 	nearbyIdx int
+	peerIdx   int
 	status    string
 
 	updateRequested   bool
@@ -106,7 +108,8 @@ type modelUI struct {
 	prompt      textinput.Model
 	modal       modalState
 	modalQueue  []modalState
-	hasNewBelow bool
+	hasNewBelow   bool
+	newBelowCount int
 }
 
 type modalState struct {
@@ -117,6 +120,8 @@ type modalState struct {
 	Invite    *model.Invite
 	SwarmID   string
 	SwarmName string
+	PeerID    string
+	PeerName  string
 }
 
 type updateCheckMsg struct {
@@ -341,6 +346,7 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages, cmd = m.messages.Update(msg)
 			if m.messages.AtBottom() {
 				m.hasNewBelow = false
+				m.newBelowCount = 0
 			}
 			return m, cmd
 		}
@@ -379,6 +385,15 @@ func (m *modelUI) View() tea.View {
 	}
 	if height == 0 {
 		height = 34
+	}
+
+	if width < 24 || height < 10 {
+		base := lipgloss.NewStyle().Foreground(colorStrong).Width(width).Height(height)
+		msg := mutedStyle.Render("Terminal too small.\nResize to at least 24×10.")
+		v := tea.NewView(base.Render(lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, msg)))
+		v.AltScreen = true
+		v.MouseMode = tea.MouseModeCellMotion
+		return v
 	}
 
 	base := lipgloss.NewStyle().Foreground(colorStrong).Width(width).Height(height)
@@ -458,6 +473,23 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if _, err := m.service.GenerateInvite(swarm.Swarm.ID); err != nil {
 			m.status = err.Error()
 		}
+	case "R":
+		if m.focus != "swarms" {
+			m.status = "focus swarms to rotate a room key"
+			return m, nil
+		}
+		swarm := m.selectedSwarm()
+		if swarm == nil {
+			m.status = "select a swarm first"
+			return m, nil
+		}
+		m.modal = modalState{
+			Kind:      "rotate",
+			Title:     "Rotate Room Key",
+			Message:   fmt.Sprintf("Rotate the room key for %s and reconnect every trusted member with a fresh topic?", swarm.Swarm.Name),
+			SwarmID:   swarm.Swarm.ID,
+			SwarmName: swarm.Swarm.Name,
+		}
 	case "d":
 		if m.focus != "swarms" {
 			m.status = "focus swarms to remove a room"
@@ -495,6 +527,31 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.status = "checking latest release"
 		m.checkingUpdate = true
 		return m, checkForUpdateCmd()
+	case "v":
+		if m.focus == "nearby" {
+			peerInfo := m.selectedNearby()
+			if peerInfo == nil {
+				m.status = "select a nearby peer first"
+				return m, nil
+			}
+			m.modal = modalState{
+				Kind:    "info",
+				Title:   "Nearby Peer",
+				Message: m.nearbyInfoMessage(*peerInfo),
+			}
+			return m, nil
+		}
+		swarm := m.selectedSwarm()
+		if swarm == nil {
+			m.status = "select a swarm first"
+			return m, nil
+		}
+		m.modal = modalState{
+			Kind:    "info",
+			Title:   "Swarm Info",
+			Message: m.swarmInfoMessage(*swarm),
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -538,6 +595,7 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.messages.PageDown()
 		if m.messages.AtBottom() {
 			m.hasNewBelow = false
+			m.newBelowCount = 0
 		}
 		return m, nil
 	case "home":
@@ -546,6 +604,7 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "end":
 		m.messages.GotoBottom()
 		m.hasNewBelow = false
+		m.newBelowCount = 0
 		return m, nil
 	case "ctrl+u":
 		m.messages.HalfPageUp()
@@ -554,6 +613,7 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.messages.HalfPageDown()
 		if m.messages.AtBottom() {
 			m.hasNewBelow = false
+			m.newBelowCount = 0
 		}
 		return m, nil
 	case "up":
@@ -561,6 +621,10 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if m.emojiIdx > 0 {
 				m.emojiIdx--
 			}
+			return m, nil
+		}
+		if m.focus == "peers" && m.peerIdx > 0 {
+			m.peerIdx--
 			return m, nil
 		}
 		if m.focus == "swarms" && m.swarmIdx > 0 {
@@ -575,6 +639,10 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if m.emojiIdx < len(m.emojiResults)-1 {
 				m.emojiIdx++
 			}
+			return m, nil
+		}
+		if m.focus == "peers" && m.peerIdx < len(m.state.Presence)-1 {
+			m.peerIdx++
 			return m, nil
 		}
 		if m.focus == "swarms" && m.swarmIdx < len(m.state.Swarms)-1 {
@@ -629,6 +697,74 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.focus != "composer" {
+		switch msg.String() {
+		case "v":
+			swarm := m.selectedSwarmSummary()
+			if m.focus == "swarms" {
+				if selected := m.selectedSwarm(); selected != nil {
+					swarm = selected
+				}
+			}
+			if swarm == nil {
+				m.status = "no swarm selected"
+				return m, nil
+			}
+			m.modal = modalState{
+				Kind:    "info",
+				Title:   "Swarm Info",
+				Message: m.swarmInfoMessage(*swarm),
+			}
+			return m, nil
+		case "x":
+			if m.focus != "peers" {
+				m.status = "focus peers to revoke a member"
+				return m, nil
+			}
+			peerInfo := m.selectedPresence()
+			if peerInfo == nil {
+				m.status = "select a peer first"
+				return m, nil
+			}
+			if peerInfo.PeerID == m.state.Identity.PeerID {
+				m.status = "select another peer to revoke"
+				return m, nil
+			}
+			if m.state.SelectedSwarm == nil {
+				m.status = "no swarm selected"
+				return m, nil
+			}
+			name := strings.TrimSpace(peerInfo.Name)
+			if name == "" {
+				name = shortID(peerInfo.PeerID)
+			}
+			m.modal = modalState{
+				Kind:      "revoke",
+				Title:     "Revoke Member",
+				Message:   fmt.Sprintf("Remove %s from %s and rotate the room key so they cannot decrypt future traffic?", name, m.state.SelectedSwarm.Name),
+				SwarmID:   m.state.SelectedSwarm.ID,
+				SwarmName: m.state.SelectedSwarm.Name,
+				PeerID:    peerInfo.PeerID,
+				PeerName:  name,
+			}
+			return m, nil
+		case "R":
+			swarm := m.selectedSwarmSummary()
+			if swarm == nil && m.state.SelectedSwarm != nil {
+				swarm = &app.SwarmSummary{Swarm: *m.state.SelectedSwarm}
+			}
+			if swarm == nil {
+				m.status = "no swarm selected"
+				return m, nil
+			}
+			m.modal = modalState{
+				Kind:      "rotate",
+				Title:     "Rotate Room Key",
+				Message:   fmt.Sprintf("Rotate the room key for %s and reconnect every trusted member with a fresh topic?", swarm.Swarm.Name),
+				SwarmID:   swarm.Swarm.ID,
+				SwarmName: swarm.Swarm.Name,
+			}
+			return m, nil
+		}
 		return m, nil
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
@@ -688,6 +824,32 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.dismissModal()
 		}
 		return m, nil
+	case "rotate":
+		switch msg.String() {
+		case "y", "enter":
+			if err := m.service.RotateRoomKey(m.modal.SwarmID); err != nil {
+				m.status = err.Error()
+			} else {
+				m.status = fmt.Sprintf("rotated the room key for %s", m.modal.SwarmName)
+			}
+			m.dismissModal()
+		case "n", "esc":
+			m.dismissModal()
+		}
+		return m, nil
+	case "revoke":
+		switch msg.String() {
+		case "y", "enter":
+			if err := m.service.RevokePeer(m.modal.SwarmID, m.modal.PeerID); err != nil {
+				m.status = err.Error()
+			} else {
+				m.status = fmt.Sprintf("removed %s from %s", m.modal.PeerName, m.modal.SwarmName)
+			}
+			m.dismissModal()
+		case "n", "esc":
+			m.dismissModal()
+		}
+		return m, nil
 	case "update":
 		switch msg.String() {
 		case "y", "enter":
@@ -698,6 +860,12 @@ func (m *modelUI) handleModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "n", "esc":
 			m.dismissModal()
 			m.status = "update canceled"
+		}
+		return m, nil
+	case "info":
+		switch msg.String() {
+		case "esc", "enter", " ":
+			m.dismissModal()
 		}
 		return m, nil
 	}
@@ -784,6 +952,7 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		prevFocus := m.focus
 		prevSwarmID := m.highlightedSwarmID()
 		prevNearbyID := m.highlightedNearbyID()
+		prevPeerID := m.highlightedPresencePeerID()
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
@@ -803,6 +972,7 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		}
 		m.restoreHighlightedSwarm(prevSwarmID)
 		m.restoreHighlightedNearby(prevNearbyID)
+		m.restoreHighlightedPresence(prevPeerID)
 		m.syncLayout()
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
 			m.syncTranscript(false)
@@ -824,12 +994,14 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		prevState := m.state
 		prevSwarmID := m.highlightedSwarmID()
 		prevNearbyID := m.highlightedNearbyID()
+		prevPeerID := m.highlightedPresencePeerID()
 		if event.Snapshot.Version >= m.state.Version {
 			m.state = event.Snapshot
 		}
 		m.status = event.Message
 		m.restoreHighlightedSwarm(prevSwarmID)
 		m.restoreHighlightedNearby(prevNearbyID)
+		m.restoreHighlightedPresence(prevPeerID)
 		m.syncLayout()
 		if selectedSwarmID(prevState) != selectedSwarmID(m.state) || !sameTranscriptEntries(prevState.Transcript, m.state.Transcript) {
 			m.syncTranscript(false)
@@ -905,6 +1077,7 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 	if width <= 0 {
 		return
 	}
+	prevLineCount := m.messages.TotalLineCount()
 	rendered := m.renderTranscriptView(m.state.Transcript, width)
 	wasAtBottom := forceBottom || m.messages.AtBottom()
 	offset := m.messages.YOffset()
@@ -912,10 +1085,19 @@ func (m *modelUI) syncTranscript(forceBottom bool) {
 	if wasAtBottom {
 		m.messages.GotoBottom()
 		m.hasNewBelow = false
+		m.newBelowCount = 0
 		return
 	}
 	// New content arrived while scrolled up.
 	m.hasNewBelow = true
+	if newLines := len(rendered.Lines) - prevLineCount; newLines > 0 {
+		// Approximate: each message is ~3 rendered lines.
+		newMsgs := (newLines + 2) / 3
+		if newMsgs < 1 {
+			newMsgs = 1
+		}
+		m.newBelowCount += newMsgs
+	}
 	maxOffset := len(rendered.Lines) - m.messages.Height()
 	if maxOffset < 0 {
 		maxOffset = 0
@@ -977,7 +1159,11 @@ func (m *modelUI) renderSwarms() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render("Swarms"))
 	if len(m.state.Swarms) == 0 {
-		lines = append(lines, "", mutedStyle.Render("No swarms yet. Press n to create one or focus Nearby and press j to join with a code."))
+		lines = append(lines, "",
+			mutedStyle.Render("No swarms yet."), "",
+			mutedStyle.Render("n  create a new swarm"),
+			mutedStyle.Render("j  join with an invite code"),
+		)
 		return strings.Join(lines, "\n")
 	}
 	for i, swarm := range m.state.Swarms {
@@ -1049,10 +1235,19 @@ func (m *modelUI) renderChat(width, height int) string {
 	if peerCount == 1 {
 		peerWord = "peer"
 	}
+	scrollHint := ""
+	if !m.messages.AtBottom() {
+		total := m.messages.TotalLineCount()
+		if total > 0 {
+			pct := m.messages.YOffset() * 100 / total
+			scrollHint = "  " + mutedStyle.Render(fmt.Sprintf("↑ %d%%", pct))
+		}
+	}
 	header := lipgloss.NewStyle().Padding(1, 2, 0, 2).Width(width).Render(
 		titleStyle.Render(active.Name) +
 			mutedStyle.Render(fmt.Sprintf(" · %d %s", peerCount, peerWord)) +
 			"  " + statusStyle.Render(m.connectionSummary()) +
+			scrollHint +
 			"  " + mutedStyle.Render(m.status),
 	)
 
@@ -1078,7 +1273,13 @@ func (m *modelUI) renderChat(width, height int) string {
 
 	var chatContent string
 	if m.hasNewBelow && !m.messages.AtBottom() {
-		pill := accentStyle.Render("↓ new messages")
+		pillText := "↓ new messages"
+		if m.newBelowCount == 1 {
+			pillText = "↓ 1 new message"
+		} else if m.newBelowCount > 1 {
+			pillText = fmt.Sprintf("↓ %d new messages", m.newBelowCount)
+		}
+		pill := accentStyle.Render(pillText)
 		chatContent = m.messages.View() + "\n" + pill + "\n" + m.renderComposerArea()
 	} else {
 		chatContent = m.messages.View() + "\n\n" + m.renderComposerArea()
@@ -1127,34 +1328,54 @@ func (m *modelUI) renderPresence() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render("Peers"))
 	if len(m.state.Presence) == 0 {
-		lines = append(lines, "", mutedStyle.Render("No peers yet."))
+		lines = append(lines, "", mutedStyle.Render("Waiting for peers to connect..."), mutedStyle.Render("Share an invite code to get started."))
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines, "")
 	// Sidebar content width: 26 total - 2 border - 4 padding = 20 usable.
 	const sidebarContent = 20
-	for _, presence := range m.state.Presence {
+	for i, presence := range m.state.Presence {
 		name := presence.Name
 		if strings.TrimSpace(name) == "" {
 			name = shortID(presence.PeerID)
 		}
 		name = truncate(name, sidebarContent-2) // 2 for dot+space
-		dot := presenceDot(presence.State)
-		nameColor := colorStrong
-		if presence.State == "stale" {
-			nameColor = colorStale
-		} else if presence.State == "offline" {
-			nameColor = colorMuted
+
+		selected := m.focus == "peers" && i == m.peerIdx
+
+		if selected {
+			// Build from plain text so selectedStyle background covers everything.
+			dot := "●"
+			if presence.State == "offline" {
+				dot = "○"
+			}
+			plain := dot + " " + name
+			handle := mentionToken(presence.Name, presence.PeerID)
+			if handle != "" {
+				plain += "  @" + truncate(handle, sidebarContent-6)
+			}
+			if presence.Typing && presence.PeerID != m.state.Identity.PeerID {
+				plain += "  " + m.typingDots()
+			}
+			lines = append(lines, selectedStyle.Render(plain))
+		} else {
+			dot := presenceDot(presence.State)
+			nameColor := colorStrong
+			if presence.State == "stale" {
+				nameColor = colorStale
+			} else if presence.State == "offline" {
+				nameColor = colorMuted
+			}
+			label := dot + " " + lipgloss.NewStyle().Foreground(nameColor).Render(name)
+			handle := mentionToken(presence.Name, presence.PeerID)
+			if handle != "" {
+				label += mutedStyle.Render("  @" + truncate(handle, sidebarContent-6))
+			}
+			if presence.Typing && presence.PeerID != m.state.Identity.PeerID {
+				label += accentStyle.Render("  " + m.typingDots())
+			}
+			lines = append(lines, label)
 		}
-		label := dot + " " + lipgloss.NewStyle().Foreground(nameColor).Render(name)
-		handle := mentionToken(presence.Name, presence.PeerID)
-		if handle != "" {
-			label += mutedStyle.Render("  @" + truncate(handle, sidebarContent-6))
-		}
-		if presence.Typing && presence.PeerID != m.state.Identity.PeerID {
-			label += accentStyle.Render("  " + m.typingDots())
-		}
-		lines = append(lines, label)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1215,11 +1436,22 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 		width = 70
 	}
 	if len(entries) == 0 {
-		return transcriptRender{Lines: []string{mutedStyle.Render("No messages yet.")}}
+		swarmName := "this swarm"
+		if m.state.SelectedSwarm != nil && m.state.SelectedSwarm.Name != "" {
+			swarmName = m.state.SelectedSwarm.Name
+		}
+		return transcriptRender{Lines: []string{
+			"",
+			accentStyle.Render("Welcome to " + swarmName),
+			"",
+			mutedStyle.Render("This is the beginning of the conversation."),
+			mutedStyle.Render("Invite peers with esc → i or just start typing."),
+		}}
 	}
 	lines := make([]string, 0, len(entries)*4)
 	prevSender := ""
 	prevKind := ""
+	prevDate := time.Time{}
 	first := true
 	insertedUnread := false
 	lastOpened := time.Time{}
@@ -1229,6 +1461,11 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 	for _, entry := range entries {
 		if !shouldRenderTranscriptEntry(entry) {
 			continue
+		}
+
+		// Date separator when the day changes.
+		if !entry.SentAt.IsZero() && !sameDay(entry.SentAt, prevDate) && !prevDate.IsZero() {
+			lines = append(lines, "", mutedStyle.Render("── "+entry.SentAt.Format("Mon Jan 2")+" ──"), "")
 		}
 
 		// Consecutive chat messages from the same sender get collapsed.
@@ -1253,9 +1490,32 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 			prevSender = ""
 		}
 		prevKind = entry.Kind
+		if !entry.SentAt.IsZero() {
+			prevDate = entry.SentAt
+		}
 		first = false
 	}
 	return transcriptRender{Lines: lines}
+}
+
+func sameDay(a, b time.Time) bool {
+	y1, m1, d1 := a.Date()
+	y2, m2, d2 := b.Date()
+	return y1 == y2 && m1 == m2 && d1 == d2
+}
+
+func relativeTime(t time.Time) string {
+	diff := time.Since(t)
+	switch {
+	case diff < time.Minute:
+		return "now"
+	case diff < time.Hour:
+		return fmt.Sprintf("%dm", int(diff.Minutes()))
+	case sameDay(t, time.Now()):
+		return t.Format("15:04")
+	default:
+		return t.Format("Jan 2 15:04")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,8 +1527,15 @@ func (m *modelUI) renderModal(content string, width, height int) string {
 	if boxWidth < 42 {
 		boxWidth = width - 8
 	}
+	if boxWidth < 4 {
+		boxWidth = width - 2
+	}
 	box := modalStyle.Width(boxWidth).Render(m.modalBody())
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box, lipgloss.WithWhitespaceChars(" "))
+	dimStyle := lipgloss.NewStyle().Foreground(colorDim).Background(colorDim)
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceStyle(dimStyle),
+	)
 }
 
 func (m *modelUI) modalBody() string {
@@ -1300,6 +1567,13 @@ func (m *modelUI) modalBody() string {
 		lines = append(lines, "")
 		lines = append(lines, dangerStyle.Render("local only"))
 		lines = append(lines, mutedStyle.Render("enter/y confirm  ·  esc/n cancel"))
+	case "rotate", "revoke":
+		lines = append(lines, "")
+		lines = append(lines, dangerStyle.Render("owner only"))
+		lines = append(lines, mutedStyle.Render("enter/y confirm  ·  esc/n cancel"))
+	case "info":
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("enter/esc close"))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1324,6 +1598,14 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 	return &peerInfo
 }
 
+func (m *modelUI) selectedPresence() *model.Presence {
+	if len(m.state.Presence) == 0 || m.peerIdx < 0 || m.peerIdx >= len(m.state.Presence) {
+		return nil
+	}
+	presence := m.state.Presence[m.peerIdx]
+	return &presence
+}
+
 func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle string, width int) string {
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
@@ -1339,7 +1621,7 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle 
 	if continuation {
 		raw = renderChatBody(entry.Body, bodyStyle, selfHandle, width-2)
 	} else {
-		ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
+		ts := mutedStyle.Render(relativeTime(entry.SentAt))
 		sep := mutedStyle.Render(" · ")
 		header := ts + sep + nameStyle.Render(entry.SenderName) + mentionBadge
 		raw = header + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle, width-2)
@@ -1355,7 +1637,7 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle 
 }
 
 func renderRenameEntry(entry model.TranscriptEntry) string {
-	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
+	ts := mutedStyle.Render(relativeTime(entry.SentAt))
 	sep := mutedStyle.Render(" · ")
 	oldName := strings.TrimSpace(entry.Body)
 	newName := strings.TrimSpace(entry.SenderName)
@@ -1429,24 +1711,24 @@ func (m *modelUI) homeFooterHelp() string {
 	w := m.width
 	if m.focus == "nearby" {
 		if w > 0 && w < 80 {
-			return "tab swarms · ↑↓ select · n new · j join · r rename\nu update · q quit"
+			return "tab swarms · ↑↓ select · n new · j join · v info\nr rename · u update · q quit"
 		}
-		return "tab swarms · ↑↓ select · n new swarm · j join selected nearby · r rename self · u update · q quit"
+		return "tab swarms · ↑↓ select · n new swarm · j join selected nearby · v info · r rename self · u update · q quit"
 	}
 	if w > 0 && w < 100 {
-		return "tab nearby · ↑↓ select · enter open · n new · r rename\ni invite · d remove · u update · q quit"
+		return "tab nearby · ↑↓ select · enter open · n new · r rename\nv info · i invite · R rotate · d remove · u update · q quit"
 	}
-	return "tab nearby · ↑↓ select · enter open swarm · n new swarm · r rename self · i invite · d remove · u update · q quit"
+	return "tab nearby · ↑↓ select · enter open swarm · n new swarm · r rename self · v info · i invite · R rotate · d remove · u update · q quit"
 }
 
 func (m *modelUI) chatFooterHelp() string {
 	switch m.focus {
 	case "peers":
-		return "tab swarms · shift+tab composer · pgup/pgdn scroll · esc back"
+		return "↑↓ select peer · x revoke · R rotate · v room info · tab swarms · shift+tab composer · pgup/pgdn scroll · esc back"
 	case "swarms":
-		return "↑↓ select swarm · enter open swarm · tab composer · pgup/pgdn scroll · esc back"
+		return "↑↓ select swarm · enter open swarm · R rotate · v info · tab composer · pgup/pgdn scroll · esc back"
 	default:
-		parts := []string{"enter send", "tab mention/focus", "/e emoji"}
+		parts := []string{"enter send", "tab mention/focus", "/e emoji", "v room info"}
 		if m.keyDisambiguation {
 			parts = append(parts, "shift+enter newline")
 		}
@@ -1509,6 +1791,13 @@ func shortID(id string) string {
 	return id[:10]
 }
 
+func displaySwarmVersion(swarm model.Swarm) uint64 {
+	if swarm.Version == 0 {
+		return 1
+	}
+	return swarm.Version
+}
+
 func truncate(s string, max int) string {
 	if max < 1 {
 		max = 1
@@ -1541,6 +1830,7 @@ func sameTranscriptEntries(left, right []model.TranscriptEntry) bool {
 			left[i].SenderPeerID != right[i].SenderPeerID ||
 			left[i].SenderName != right[i].SenderName ||
 			left[i].Body != right[i].Body ||
+			left[i].Signature != right[i].Signature ||
 			!left[i].SentAt.Equal(right[i].SentAt) ||
 			left[i].Local != right[i].Local {
 			return false
@@ -1650,13 +1940,15 @@ func (m *modelUI) typingSummary() string {
 }
 
 func (m *modelUI) connectionSummary() string {
-	selected := m.selectedSwarmSummary()
-	if selected == nil || !selected.Connected {
+	if m.state.SelectedSwarm == nil {
 		return "✕ offline"
 	}
 	online := 0
 	stale := 0
 	for _, presence := range m.state.Presence {
+		if presence.PeerID == m.state.Identity.PeerID {
+			continue
+		}
 		switch presence.State {
 		case "online":
 			online++
@@ -1664,8 +1956,14 @@ func (m *modelUI) connectionSummary() string {
 			stale++
 		}
 	}
-	if online <= 1 {
-		return "◎ connecting..."
+	if online == 0 && stale == 0 {
+		return "◎ waiting for peers"
+	}
+	if online == 0 {
+		if stale == 1 {
+			return "◌ 1 stale"
+		}
+		return fmt.Sprintf("◌ %d stale", stale)
 	}
 	summary := fmt.Sprintf("◉ %d online", online)
 	if stale > 0 {
@@ -1684,6 +1982,77 @@ func (m *modelUI) selectedSwarmSummary() *app.SwarmSummary {
 		}
 	}
 	return nil
+}
+
+func (m *modelUI) swarmInfoMessage(swarm app.SwarmSummary) string {
+	status := "saved locally"
+	switch {
+	case m.state.SelectedSwarm != nil && m.state.SelectedSwarm.ID == swarm.Swarm.ID:
+		status = m.connectionSummary()
+	case swarm.Connected:
+		status = "online"
+	}
+	lines := []string{
+		accentStyle.Render(swarm.Swarm.Name),
+		mutedStyle.Render("id " + swarm.Swarm.ID),
+		mutedStyle.Render("status " + status),
+		mutedStyle.Render("owner " + shortID(swarm.Swarm.OwnerPeerID)),
+		mutedStyle.Render(fmt.Sprintf("version %d", displaySwarmVersion(swarm.Swarm))),
+		mutedStyle.Render(fmt.Sprintf("%d trusted peers", len(swarm.Swarm.TrustedPeers))),
+	}
+	if handle := m.selfMentionHandle(); handle != "" {
+		lines = append(lines, mutedStyle.Render("your handle @"+handle))
+	}
+	presenceByPeer := make(map[string]model.Presence, len(m.state.Presence))
+	for _, presence := range m.state.Presence {
+		presenceByPeer[presence.PeerID] = presence
+	}
+	for _, trusted := range swarm.Swarm.TrustedPeers {
+		state := "saved"
+		switch {
+		case trusted.PeerID == m.state.Identity.PeerID:
+			state = "self"
+		case presenceByPeer[trusted.PeerID].PeerID != "":
+			state = presenceByPeer[trusted.PeerID].State
+			if presenceByPeer[trusted.PeerID].Typing {
+				state += " typing"
+			}
+		}
+		lines = append(lines, "")
+		lines = append(lines, displayTrustedName(trusted)+"  "+mutedStyle.Render(state))
+		if handle := mentionToken(trusted.Name, trusted.PeerID); handle != "" {
+			lines = append(lines, mutedStyle.Render("handle @"+handle))
+		}
+		if strings.TrimSpace(trusted.Fingerprint) != "" {
+			lines = append(lines, mutedStyle.Render("fingerprint "+trusted.Fingerprint))
+		}
+		if !trusted.LastSeen.IsZero() && trusted.PeerID != m.state.Identity.PeerID {
+			lines = append(lines, mutedStyle.Render("last seen "+trusted.LastSeen.Format("Jan 2 15:04")))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *modelUI) nearbyInfoMessage(peerInfo model.NearbyPeer) string {
+	lines := []string{
+		accentStyle.Render(nearbyLabel(peerInfo)),
+		mutedStyle.Render("peer id " + peerInfo.PeerID),
+	}
+	if strings.TrimSpace(peerInfo.Fingerprint) != "" {
+		lines = append(lines, mutedStyle.Render("fingerprint "+peerInfo.Fingerprint))
+	}
+	lines = append(lines, mutedStyle.Render("seen "+peerInfo.LastSeen.Format("Jan 2 15:04:05")))
+	if handle := mentionToken(peerInfo.Name, peerInfo.PeerID); handle != "" {
+		lines = append(lines, mutedStyle.Render("handle @"+handle))
+	}
+	if len(peerInfo.Addrs) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("addresses"))
+		for _, addr := range peerInfo.Addrs {
+			lines = append(lines, addr)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *modelUI) updateComposerPlaceholder() {
@@ -2000,11 +2369,16 @@ func (m *modelUI) highlightedNearbyID() string {
 	return ""
 }
 
+func (m *modelUI) highlightedPresencePeerID() string {
+	if presence := m.selectedPresence(); presence != nil {
+		return presence.PeerID
+	}
+	return ""
+}
+
 func (m *modelUI) restoreHighlightedSwarm(previous string) {
 	if previous == "" {
-		if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
-			m.swarmIdx = len(m.state.Swarms) - 1
-		}
+		m.swarmIdx = clampIdx(m.swarmIdx, len(m.state.Swarms))
 		return
 	}
 	for i := range m.state.Swarms {
@@ -2013,16 +2387,12 @@ func (m *modelUI) restoreHighlightedSwarm(previous string) {
 			return
 		}
 	}
-	if m.swarmIdx >= len(m.state.Swarms) && len(m.state.Swarms) > 0 {
-		m.swarmIdx = len(m.state.Swarms) - 1
-	}
+	m.swarmIdx = clampIdx(m.swarmIdx, len(m.state.Swarms))
 }
 
 func (m *modelUI) restoreHighlightedNearby(previous string) {
 	if previous == "" {
-		if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
-			m.nearbyIdx = len(m.state.Nearby) - 1
-		}
+		m.nearbyIdx = clampIdx(m.nearbyIdx, len(m.state.Nearby))
 		return
 	}
 	for i := range m.state.Nearby {
@@ -2031,9 +2401,31 @@ func (m *modelUI) restoreHighlightedNearby(previous string) {
 			return
 		}
 	}
-	if m.nearbyIdx >= len(m.state.Nearby) && len(m.state.Nearby) > 0 {
-		m.nearbyIdx = len(m.state.Nearby) - 1
+	m.nearbyIdx = clampIdx(m.nearbyIdx, len(m.state.Nearby))
+}
+
+func (m *modelUI) restoreHighlightedPresence(previous string) {
+	if previous == "" {
+		m.peerIdx = clampIdx(m.peerIdx, len(m.state.Presence))
+		return
 	}
+	for i := range m.state.Presence {
+		if m.state.Presence[i].PeerID == previous {
+			m.peerIdx = i
+			return
+		}
+	}
+	m.peerIdx = clampIdx(m.peerIdx, len(m.state.Presence))
+}
+
+func clampIdx(idx, length int) int {
+	if length == 0 {
+		return 0
+	}
+	if idx >= length {
+		return length - 1
+	}
+	return idx
 }
 
 func (m *modelUI) notifyTyping(active bool) {

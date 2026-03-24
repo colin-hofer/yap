@@ -72,11 +72,12 @@ The implementation follows a layered design:
 ## User Model
 
 - A device has one persisted identity.
-- A swarm is a saved room with a stable ID, room key, and trusted peers.
+- A swarm is a saved room with a stable ID, room key, owner, config version, and trusted peers.
 - Pairing is explicit and mutual:
-  - the inviter creates an expiring invite code for a swarm
+  - the room owner creates an expiring invite code for a swarm
   - the invitee discovers the inviter on the LAN and enters the code
   - both sides confirm the other side's identity card before trust is stored
+- The room owner is also the only peer allowed to rotate the room key, revoke a member, or admit new members in a way the rest of the room will accept.
 
 ## Commands
 
@@ -96,7 +97,9 @@ yap version
 - `n`: create a new swarm
 - `r`: rename this device/user
 - `i`: generate an invite for the selected swarm when the swarms list is focused
+- `R`: rotate the room key for the selected swarm when the swarms list is focused
 - `j`: join the selected nearby peer with an invite code when the nearby list is focused
+- `v`: inspect the selected swarm or nearby peer
 - `d`: remove the selected swarm locally when the swarms list is focused
 - `u`: quit the TUI and install the latest GitHub release for the current OS/arch
 - `q`: quit
@@ -106,6 +109,9 @@ yap version
 - `enter`: send the current composer contents
 - `shift+enter`: insert a newline when the terminal supports key disambiguation
 - `tab`: complete an `@mention` while typing
+- `x`: revoke the selected peer when the peers sidebar is focused
+- `R`: rotate the room key when the swarms sidebar is focused
+- `v`: inspect the current or highlighted swarm
 - `pgup` / `pgdn`: scroll the transcript
 - `esc`: leave the current chat and return to the home screen
 - `ctrl+c`: quit
@@ -126,7 +132,9 @@ All app-managed files are written with private permissions.
 
 ## Transport Note
 
-Internally, each swarm maps to a libp2p GossipSub channel named `yap/swarm/<swarm-id>/v2`. That channel is just the pubsub transport used to move encrypted chat and presence messages between trusted peers in the same swarm.
+Internally, each swarm maps to a libp2p GossipSub channel named like `yap/swarm/<room-topic-hash>/v3`, where the topic hash is derived from the shared room key. That channel is just the pubsub transport used to move encrypted chat and presence messages between trusted peers in the same swarm.
+
+Membership changes and room-key rotations are not broadcast on the old room topic. Instead, the room owner pushes the new swarm config directly to the remaining trusted peers over an authenticated libp2p stream, and those peers reopen the swarm on the new topic derived from the rotated room key.
 
 The current build defaults to TCP libp2p listeners for stability on Go 1.26.x. QUIC can be enabled experimentally with:
 

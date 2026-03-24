@@ -43,6 +43,8 @@ type Swarm struct {
 	ID           string        `json:"id"`
 	Name         string        `json:"name"`
 	RoomKey      string        `json:"room_key"`
+	OwnerPeerID  string        `json:"owner_peer_id,omitempty"`
+	Version      uint64        `json:"version,omitempty"`
 	TrustedPeers []TrustedPeer `json:"trusted_peers,omitempty"`
 	LastOpened   time.Time     `json:"last_opened,omitempty"`
 }
@@ -56,6 +58,7 @@ type TranscriptEntry struct {
 	SenderName   string    `json:"sender_name"`
 	Body         string    `json:"body"`
 	SentAt       time.Time `json:"sent_at"`
+	Signature    string    `json:"signature,omitempty"`
 	Local        bool      `json:"local,omitempty"`
 }
 

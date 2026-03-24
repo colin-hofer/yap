@@ -124,6 +124,9 @@ func New(parent context.Context, opts Options) (*Service, error) {
 		cancel()
 		return nil, err
 	}
+	for i := range swarms {
+		swarms[i] = normalizeSwarmMetadata(swarms[i])
+	}
 
 	svc := &Service{
 		ctx:           ctx,
@@ -168,7 +171,7 @@ func New(parent context.Context, opts Options) (*Service, error) {
 			continue
 		}
 		svc.mu.Lock()
-		svc.connected[swarm.ID] = true
+		svc.connected[swarm.ID] = false
 		svc.mu.Unlock()
 	}
 
@@ -221,6 +224,8 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 		ID:           id,
 		Name:         name,
 		RoomKey:      roomKey,
+		OwnerPeerID:  self.PeerID,
+		Version:      1,
 		TrustedPeers: []model.TrustedPeer{self},
 		LastOpened:   time.Now(),
 	}
@@ -261,6 +266,7 @@ func (s *Service) RenameIdentity(name string) error {
 	updatedSwarms := make([]model.Swarm, 0, len(swarms))
 	for _, swarm := range swarms {
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, self)
+		swarm = normalizeSwarmMetadata(swarm)
 		updatedSwarms = append(updatedSwarms, swarm)
 	}
 
@@ -289,6 +295,7 @@ func (s *Service) OpenSwarm(ref string) error {
 	if err != nil {
 		return err
 	}
+	swarm = normalizeSwarmMetadata(swarm)
 	swarm.LastOpened = time.Now()
 	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 	if err := s.store.SaveSwarm(swarm); err != nil {
@@ -300,7 +307,7 @@ func (s *Service) OpenSwarm(ref string) error {
 
 	s.mu.Lock()
 	s.selectedID = swarm.ID
-	s.connected[swarm.ID] = true
+	s.connected[swarm.ID] = false
 	s.unread[swarm.ID] = 0
 	if _, ok := s.transcripts[swarm.ID]; !ok {
 		transcript, err := s.store.LoadTranscript(swarm.ID)
@@ -364,11 +371,77 @@ func (s *Service) RemoveSwarm(ref string) error {
 	return nil
 }
 
+// RotateRoomKey rotates the shared room key while keeping the same saved swarm.
+// Only the swarm owner can rotate the room key for the room.
+func (s *Service) RotateRoomKey(ref string) error {
+	swarm, err := s.findSwarm(ref)
+	if err != nil {
+		return err
+	}
+	updated, _, err := prepareSwarmRotation(swarm, s.node.Self(), "")
+	if err != nil {
+		return err
+	}
+	if err := s.store.SaveSwarm(updated); err != nil {
+		return err
+	}
+	if err := s.node.OpenSwarm(updated); err != nil {
+		return err
+	}
+	s.node.BroadcastSwarmUpdate(updated, "rotate", nil)
+
+	s.mu.Lock()
+	s.connected[updated.ID] = false
+	s.replaceSwarmLocked(updated)
+	s.presence[updated.ID] = filterPresenceForSwarm(s.presence[updated.ID], updated)
+	s.mu.Unlock()
+
+	s.appendLocalSystemEntry(updated.ID, "Rotated the room key.")
+	s.emitToast(fmt.Sprintf("rotated the room key for %s", updated.Name))
+	s.emitSync()
+	return nil
+}
+
+// RevokePeer removes a trusted member from a swarm and rotates the room key so
+// the removed peer can no longer decrypt future traffic.
+func (s *Service) RevokePeer(ref, peerID string) error {
+	swarm, err := s.findSwarm(ref)
+	if err != nil {
+		return err
+	}
+	updated, removed, err := prepareSwarmRotation(swarm, s.node.Self(), peerID)
+	if err != nil {
+		return err
+	}
+	if err := s.store.SaveSwarm(updated); err != nil {
+		return err
+	}
+	if err := s.node.OpenSwarm(updated); err != nil {
+		return err
+	}
+	s.node.BroadcastSwarmUpdate(updated, "revoke", removed)
+
+	s.mu.Lock()
+	s.connected[updated.ID] = false
+	s.replaceSwarmLocked(updated)
+	s.presence[updated.ID] = filterPresenceForSwarm(s.presence[updated.ID], updated)
+	s.mu.Unlock()
+
+	s.appendLocalSystemEntry(updated.ID, fmt.Sprintf("Removed %s and rotated the room key.", displayName(*removed)))
+	s.emitToast(fmt.Sprintf("removed %s from %s", displayName(*removed), updated.Name))
+	s.emitSync()
+	return nil
+}
+
 // GenerateInvite creates a new invite for a swarm and notifies the UI.
 func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
 		return model.Invite{}, err
+	}
+	swarm = normalizeSwarmMetadata(swarm)
+	if !swarmOwnedBy(swarm, s.identity.PeerID) {
+		return model.Invite{}, fmt.Errorf("only the room owner can invite new members")
 	}
 	invite, err := s.node.CreateInvite(swarm)
 	if err != nil {
@@ -470,6 +543,10 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		s.handleHistoryImport(event.SwarmID, event.Entries)
 	case p2p.EventPresence:
 		s.handlePresenceEvent(event.SwarmID, event.Presence)
+	case p2p.EventSwarmUpdate:
+		if event.SwarmUpdate != nil {
+			s.handleSwarmUpdate(*event.SwarmUpdate)
+		}
 	}
 }
 
@@ -565,6 +642,7 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 	}
 	s.mu.Lock()
 	s.presence[swarmID] = append([]model.Presence(nil), presence...)
+	s.connected[swarmID] = swarmHasOnlineRemotePeer(presence, s.identity.PeerID)
 	swarm, ok := s.findSwarmLocked(swarmID)
 	if !ok {
 		s.mu.Unlock()
@@ -585,6 +663,7 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 		})
 		if !trustedPeersEqual(swarm.TrustedPeers, next) {
 			swarm.TrustedPeers = next
+			swarm = normalizeSwarmMetadata(swarm)
 			updated = true
 		}
 	}
@@ -598,14 +677,47 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 	s.emitSync()
 }
 
+func (s *Service) handleSwarmUpdate(update p2p.SwarmUpdate) {
+	swarm := normalizeSwarmMetadata(update.Swarm)
+	if strings.TrimSpace(swarm.ID) == "" {
+		return
+	}
+	current, err := s.findSwarm(swarm.ID)
+	if err != nil {
+		return
+	}
+	if swarmVersion(swarm) <= swarmVersion(current) {
+		return
+	}
+
+	if err := s.store.SaveSwarm(swarm); err != nil {
+		s.emitToast(err.Error())
+		return
+	}
+	if err := s.node.OpenSwarm(swarm); err != nil {
+		s.emitToast(err.Error())
+	}
+
+	s.mu.Lock()
+	s.connected[swarm.ID] = false
+	s.replaceSwarmLocked(swarm)
+	s.presence[swarm.ID] = filterPresenceForSwarm(s.presence[swarm.ID], swarm)
+	s.mu.Unlock()
+
+	if _, systemMessage := swarmUpdateMessages(update, current.Name); strings.TrimSpace(systemMessage) != "" {
+		s.appendLocalSystemEntry(swarm.ID, systemMessage)
+	}
+	if toastMessage, _ := swarmUpdateMessages(update, current.Name); strings.TrimSpace(toastMessage) != "" {
+		s.emitToast(toastMessage)
+	}
+	s.emitSync()
+}
+
 func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 	switch result.Direction {
 	case "incoming":
-		swarm, err := s.findSwarm(result.Swarm.ID)
-		if err != nil {
-			s.emitToast(err.Error())
-			return
-		}
+		swarm := normalizeSwarmMetadata(result.Swarm)
+		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, result.Peer)
 		if err := s.store.SaveSwarm(swarm); err != nil {
 			s.emitToast(err.Error())
@@ -614,14 +726,18 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		if err := s.node.OpenSwarm(swarm); err != nil {
 			s.emitToast(err.Error())
 		}
+		s.node.BroadcastSwarmUpdate(swarm, "join", &result.Peer)
 		s.mu.Lock()
-		s.connected[swarm.ID] = true
+		s.connected[swarm.ID] = false
 		s.replaceSwarmLocked(swarm)
 		s.mu.Unlock()
 		s.emitToast(fmt.Sprintf("%s joined %s", displayName(result.Peer), swarm.Name))
 		s.emitSync()
 	case "outgoing":
-		swarm := result.Swarm
+		swarm := normalizeSwarmMetadata(result.Swarm)
+		if swarm.OwnerPeerID == "" {
+			swarm.OwnerPeerID = result.Peer.PeerID
+		}
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, result.Peer)
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 		swarm.LastOpened = time.Now()
@@ -642,7 +758,7 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		}
 		s.transcriptLag[swarm.ID] = 0
 		s.lastActivity[swarm.ID] = swarm.LastOpened
-		s.connected[swarm.ID] = true
+		s.connected[swarm.ID] = false
 		_ = s.reloadSwarmsLocked()
 		s.mu.Unlock()
 
@@ -1050,6 +1166,18 @@ func entryAddsUnread(entry model.TranscriptEntry) bool {
 	}
 }
 
+func swarmHasOnlineRemotePeer(presence []model.Presence, selfPeerID string) bool {
+	for _, item := range presence {
+		if item.PeerID == selfPeerID {
+			continue
+		}
+		if item.State == "online" {
+			return true
+		}
+	}
+	return false
+}
+
 func renameEntrySummary(entry model.TranscriptEntry) string {
 	oldName := strings.TrimSpace(entry.Body)
 	newName := strings.TrimSpace(entry.SenderName)
@@ -1120,6 +1248,8 @@ func shortID(id string) string {
 }
 
 func trustedPeersEqual(left, right []model.TrustedPeer) bool {
+	left = sortedTrustedPeers(left)
+	right = sortedTrustedPeers(right)
 	if len(left) != len(right) {
 		return false
 	}
@@ -1133,6 +1263,194 @@ func trustedPeersEqual(left, right []model.TrustedPeer) bool {
 		}
 	}
 	return true
+}
+
+func sortedTrustedPeers(peers []model.TrustedPeer) []model.TrustedPeer {
+	out := append([]model.TrustedPeer(nil), peers...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].PeerID == out[j].PeerID {
+			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		}
+		return out[i].PeerID < out[j].PeerID
+	})
+	return out
+}
+
+func normalizeSwarmMetadata(swarm model.Swarm) model.Swarm {
+	if swarm.OwnerPeerID == "" {
+		swarm.OwnerPeerID = swarmOwnerPeerID(swarm)
+	}
+	if swarm.Version == 0 {
+		swarm.Version = 1
+	}
+	if owner := swarmOwnerPeerID(swarm); owner != "" && len(swarm.TrustedPeers) > 0 {
+		if ownerPeer, ok := trustedPeerByID(swarm.TrustedPeers, owner); ok {
+			others := make([]model.TrustedPeer, 0, len(swarm.TrustedPeers))
+			for _, trusted := range swarm.TrustedPeers {
+				if trusted.PeerID == owner {
+					continue
+				}
+				others = append(others, trusted)
+			}
+			sort.Slice(others, func(i, j int) bool {
+				return others[i].PeerID < others[j].PeerID
+			})
+			swarm.TrustedPeers = append([]model.TrustedPeer{ownerPeer}, others...)
+		}
+	}
+	return swarm
+}
+
+func swarmOwnerPeerID(swarm model.Swarm) string {
+	if owner := strings.TrimSpace(swarm.OwnerPeerID); owner != "" {
+		return owner
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if peerID := strings.TrimSpace(trusted.PeerID); peerID != "" {
+			return peerID
+		}
+	}
+	return ""
+}
+
+func swarmVersion(swarm model.Swarm) uint64 {
+	if swarm.Version == 0 {
+		return 1
+	}
+	return swarm.Version
+}
+
+func nextSwarmVersion(swarm model.Swarm) uint64 {
+	return swarmVersion(swarm) + 1
+}
+
+func swarmOwnedBy(swarm model.Swarm, peerID string) bool {
+	peerID = strings.TrimSpace(peerID)
+	return peerID != "" && swarmOwnerPeerID(swarm) == peerID
+}
+
+func trustedPeerByID(peers []model.TrustedPeer, peerID string) (model.TrustedPeer, bool) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return model.TrustedPeer{}, false
+	}
+	for _, trusted := range peers {
+		if trusted.PeerID == peerID {
+			return trusted, true
+		}
+	}
+	return model.TrustedPeer{}, false
+}
+
+func removeTrustedPeer(peers []model.TrustedPeer, peerID string) ([]model.TrustedPeer, *model.TrustedPeer) {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return append([]model.TrustedPeer(nil), peers...), nil
+	}
+	out := make([]model.TrustedPeer, 0, len(peers))
+	var removed *model.TrustedPeer
+	for _, trusted := range peers {
+		if trusted.PeerID == peerID {
+			copy := trusted
+			removed = &copy
+			continue
+		}
+		out = append(out, trusted)
+	}
+	return out, removed
+}
+
+func prepareSwarmRotation(swarm model.Swarm, self model.TrustedPeer, removedPeerID string) (model.Swarm, *model.TrustedPeer, error) {
+	swarm = normalizeSwarmMetadata(swarm)
+	if !swarmOwnedBy(swarm, self.PeerID) {
+		return model.Swarm{}, nil, fmt.Errorf("only the room owner can change membership or rotate the room key")
+	}
+	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, self)
+
+	var removed *model.TrustedPeer
+	if removedPeerID = strings.TrimSpace(removedPeerID); removedPeerID != "" {
+		if removedPeerID == self.PeerID {
+			return model.Swarm{}, nil, fmt.Errorf("the room owner cannot revoke themselves")
+		}
+		var nextPeers []model.TrustedPeer
+		nextPeers, removed = removeTrustedPeer(swarm.TrustedPeers, removedPeerID)
+		if removed == nil {
+			return model.Swarm{}, nil, fmt.Errorf("peer %q is not trusted for %s", removedPeerID, swarm.Name)
+		}
+		swarm.TrustedPeers = nextPeers
+	}
+
+	roomKey, err := yapcrypto.NewRoomKey()
+	if err != nil {
+		return model.Swarm{}, nil, err
+	}
+	swarm.RoomKey = roomKey
+	swarm.Version = nextSwarmVersion(swarm)
+	swarm = normalizeSwarmMetadata(swarm)
+	return swarm, removed, nil
+}
+
+func filterPresenceForSwarm(presence []model.Presence, swarm model.Swarm) []model.Presence {
+	if len(presence) == 0 {
+		return nil
+	}
+	out := make([]model.Presence, 0, len(presence))
+	for _, item := range presence {
+		if item.PeerID == "" {
+			continue
+		}
+		if item.PeerID == swarmOwnerPeerID(swarm) || swarmHasTrustedPeerID(swarm.TrustedPeers, item.PeerID) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func swarmUpdateMessages(update p2p.SwarmUpdate, swarmName string) (string, string) {
+	actorName := displayName(update.Actor)
+	switch update.Reason {
+	case "join":
+		if update.Target == nil {
+			return fmt.Sprintf("%s updated %s", actorName, swarmName), fmt.Sprintf("%s updated room membership.", actorName)
+		}
+		targetName := displayName(*update.Target)
+		return fmt.Sprintf("%s added %s to %s", actorName, targetName, swarmName), fmt.Sprintf("%s added %s to the room.", actorName, targetName)
+	case "revoke":
+		if update.Target == nil {
+			return fmt.Sprintf("%s changed membership in %s", actorName, swarmName), fmt.Sprintf("%s changed room membership and rotated the room key.", actorName)
+		}
+		targetName := displayName(*update.Target)
+		return fmt.Sprintf("%s removed %s from %s", actorName, targetName, swarmName), fmt.Sprintf("%s removed %s and rotated the room key.", actorName, targetName)
+	case "rotate":
+		return fmt.Sprintf("%s rotated the room key for %s", actorName, swarmName), fmt.Sprintf("%s rotated the room key.", actorName)
+	default:
+		return fmt.Sprintf("%s updated %s", actorName, swarmName), fmt.Sprintf("%s updated room membership.", actorName)
+	}
+}
+
+func (s *Service) appendLocalSystemEntry(swarmID, body string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	s.handleTranscriptEvent(model.TranscriptEntry{
+		ID:           mustLocalEntryID(),
+		SwarmID:      strings.TrimSpace(swarmID),
+		Kind:         "system",
+		SenderPeerID: s.identity.PeerID,
+		SenderName:   s.identity.Name,
+		Body:         body,
+		SentAt:       time.Now(),
+		Local:        true,
+	}, true)
+}
+
+func mustLocalEntryID() string {
+	id, err := yapcrypto.RandomID(12)
+	if err != nil {
+		return fmt.Sprintf("local-%d", time.Now().UnixNano())
+	}
+	return "local-" + id
 }
 
 func swarmHasTrustedPeerID(peers []model.TrustedPeer, peerID string) bool {

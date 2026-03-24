@@ -47,6 +47,57 @@ func TestHandleTranscriptEventTracksUnreadForUnselectedSwarm(t *testing.T) {
 	}
 }
 
+func TestPrepareSwarmRotationRequiresOwner(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := prepareSwarmRotation(model.Swarm{
+		ID:          "swarm-1",
+		Name:        "Alpha",
+		RoomKey:     "room-key",
+		OwnerPeerID: "peer-owner",
+		Version:     2,
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-owner", Name: "Owner"},
+			{PeerID: "peer-self", Name: "Self"},
+		},
+	}, model.TrustedPeer{PeerID: "peer-self", Name: "Self"}, "")
+	if err == nil {
+		t.Fatal("prepareSwarmRotation() unexpectedly allowed a non-owner to rotate the room key")
+	}
+}
+
+func TestPrepareSwarmRotationRemovesPeerAndBumpsVersion(t *testing.T) {
+	t.Parallel()
+
+	updated, removed, err := prepareSwarmRotation(model.Swarm{
+		ID:          "swarm-1",
+		Name:        "Alpha",
+		RoomKey:     "room-key",
+		OwnerPeerID: "peer-owner",
+		Version:     4,
+		TrustedPeers: []model.TrustedPeer{
+			{PeerID: "peer-owner", Name: "Owner"},
+			{PeerID: "peer-a", Name: "Alice"},
+			{PeerID: "peer-b", Name: "Bob"},
+		},
+	}, model.TrustedPeer{PeerID: "peer-owner", Name: "Owner"}, "peer-b")
+	if err != nil {
+		t.Fatalf("prepareSwarmRotation() error = %v", err)
+	}
+	if removed == nil || removed.PeerID != "peer-b" {
+		t.Fatalf("removed = %+v, want peer-b", removed)
+	}
+	if got, want := updated.Version, uint64(5); got != want {
+		t.Fatalf("updated.Version = %d, want %d", got, want)
+	}
+	if updated.RoomKey == "room-key" {
+		t.Fatal("updated.RoomKey unexpectedly unchanged")
+	}
+	if swarmHasTrustedPeerID(updated.TrustedPeers, "peer-b") {
+		t.Fatal("updated swarm still trusts revoked peer")
+	}
+}
+
 func TestHandleHistoryImportCountsOnlyChatEntries(t *testing.T) {
 	svc := &Service{
 		ctx:          context.Background(),
@@ -280,6 +331,37 @@ func TestHandlePresenceEventDoesNotAddUnknownTrustedPeer(t *testing.T) {
 	}
 	if got, want := svc.presence["swarm-1"][0].PeerID, "peer-1"; got != want {
 		t.Fatalf("svc.presence[swarm-1][0].PeerID = %q, want %q", got, want)
+	}
+}
+
+func TestHandlePresenceEventTracksOnlineRemoteConnectivity(t *testing.T) {
+	svc := &Service{
+		ctx:          context.Background(),
+		identity:     model.Identity{PeerID: "self"},
+		swarms:       []model.Swarm{{ID: "swarm-1", Name: "Alpha"}},
+		nearby:       make(map[string]model.NearbyPeer),
+		transcripts:  make(map[string][]model.TranscriptEntry),
+		presence:     make(map[string][]model.Presence),
+		unread:       make(map[string]int),
+		connected:    make(map[string]bool),
+		lastActivity: make(map[string]time.Time),
+		events:       make(chan Event, 8),
+	}
+
+	svc.handlePresenceEvent("swarm-1", []model.Presence{
+		{PeerID: "self", State: "online"},
+		{PeerID: "peer-1", State: "stale"},
+	})
+	if svc.connected["swarm-1"] {
+		t.Fatal("connected[swarm-1] = true, want false with no online remote peers")
+	}
+
+	svc.handlePresenceEvent("swarm-1", []model.Presence{
+		{PeerID: "self", State: "online"},
+		{PeerID: "peer-1", State: "online"},
+	})
+	if !svc.connected["swarm-1"] {
+		t.Fatal("connected[swarm-1] = false, want true with an online remote peer")
 	}
 }
 

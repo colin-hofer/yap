@@ -31,6 +31,7 @@ type wireTranscriptEntry struct {
 	SenderName   string    `json:"sender_name"`
 	Body         string    `json:"body"`
 	SentAt       time.Time `json:"sent_at"`
+	Signature    string    `json:"signature,omitempty"`
 }
 
 func (n *Node) handleHistoryStream(stream network.Stream) {
@@ -49,7 +50,8 @@ func (n *Node) handleHistoryStream(stream network.Stream) {
 	}
 
 	remotePeer := stream.Conn().RemotePeer()
-	if _, ok := n.loadTrustedSwarm(request.SwarmID, remotePeer); !ok {
+	swarm, ok := n.loadTrustedSwarm(request.SwarmID, remotePeer)
+	if !ok {
 		_ = json.NewEncoder(stream).Encode(historyResponse{Error: "peer is not trusted for swarm"})
 		return
 	}
@@ -60,7 +62,7 @@ func (n *Node) handleHistoryStream(stream network.Stream) {
 		return
 	}
 	request.Entries = clampWireTranscriptEntries(request.Entries)
-	remoteEntries := fromWireTranscriptEntries(request.Entries, n.host.ID().String())
+	remoteEntries := n.verifiedTranscriptEntries(swarm, request.Entries, n.host.ID().String())
 	added, err := n.store.MergeTranscript(request.SwarmID, remoteEntries)
 	if err != nil {
 		_ = json.NewEncoder(stream).Encode(historyResponse{Error: "failed to merge transcript"})
@@ -71,7 +73,7 @@ func (n *Node) handleHistoryStream(stream network.Stream) {
 	}
 
 	response := historyResponse{
-		Entries: toWireTranscriptEntries(diffTranscriptEntries(localEntries, remoteEntries)),
+		Entries: n.toWireTranscriptEntries(diffTranscriptEntries(localEntries, remoteEntries)),
 	}
 	_ = json.NewEncoder(stream).Encode(response)
 }
@@ -118,7 +120,7 @@ func (n *Node) syncSwarmPeer(swarm model.Swarm, trusted model.TrustedPeer) {
 	}
 	request := historyRequest{
 		SwarmID: swarm.ID,
-		Entries: toWireTranscriptEntries(localEntries),
+		Entries: n.toWireTranscriptEntries(localEntries),
 	}
 	if err := json.NewEncoder(stream).Encode(request); err != nil {
 		return
@@ -133,7 +135,7 @@ func (n *Node) syncSwarmPeer(swarm model.Swarm, trusted model.TrustedPeer) {
 	}
 
 	response.Entries = clampWireTranscriptEntries(response.Entries)
-	remoteEntries := fromWireTranscriptEntries(response.Entries, n.host.ID().String())
+	remoteEntries := n.verifiedTranscriptEntries(swarm, response.Entries, n.host.ID().String())
 	added, err := n.store.MergeTranscript(swarm.ID, remoteEntries)
 	if err != nil || len(added) == 0 {
 		return
@@ -181,14 +183,36 @@ func diffTranscriptEntries(source, other []model.TranscriptEntry) []model.Transc
 	return out
 }
 
-func toWireTranscriptEntries(entries []model.TranscriptEntry) []wireTranscriptEntry {
+func (n *Node) toWireTranscriptEntries(entries []model.TranscriptEntry) []wireTranscriptEntry {
 	if len(entries) > store.TranscriptLimit {
 		entries = entries[len(entries)-store.TranscriptLimit:]
 	}
+	selfPeerID := ""
+	if n != nil && n.host != nil {
+		selfPeerID = n.host.ID().String()
+	}
 	out := make([]wireTranscriptEntry, 0, len(entries))
 	for _, entry := range entries {
+		if !allowedTranscriptKind(entry.Kind) {
+			continue
+		}
 		body, ok := sanitizeChatBody(entry.Body)
 		if entry.Kind == "chat" && !ok {
+			continue
+		}
+		signature := strings.TrimSpace(entry.Signature)
+		if signature == "" && selfPeerID != "" && entry.SenderPeerID == selfPeerID {
+			signed := entry
+			signed.Body = body
+			signed.Signature, _ = n.signTranscriptEntry(signed)
+			signature = strings.TrimSpace(signed.Signature)
+		}
+		if signature == "" {
+			continue
+		}
+		entry.Body = body
+		entry.Signature = signature
+		if n != nil && !n.verifyTranscriptEntrySignature(entry) {
 			continue
 		}
 		out = append(out, wireTranscriptEntry{
@@ -199,31 +223,42 @@ func toWireTranscriptEntries(entries []model.TranscriptEntry) []wireTranscriptEn
 			SenderName:   sanitizeDisplayName(entry.SenderName),
 			Body:         body,
 			SentAt:       clampEventTime(entry.SentAt),
+			Signature:    signature,
 		})
 	}
 	return out
 }
 
-func fromWireTranscriptEntries(entries []wireTranscriptEntry, localPeerID string) []model.TranscriptEntry {
+func (n *Node) verifiedTranscriptEntries(swarm model.Swarm, entries []wireTranscriptEntry, localPeerID string) []model.TranscriptEntry {
 	out := make([]model.TranscriptEntry, 0, len(entries))
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.ID) == "" {
+		swarmID := strings.TrimSpace(entry.SwarmID)
+		senderPeerID := strings.TrimSpace(entry.SenderPeerID)
+		if strings.TrimSpace(entry.ID) == "" || swarmID != swarm.ID || !allowedTranscriptKind(entry.Kind) {
+			continue
+		}
+		if !swarmHasTrustedPeerID(swarm, senderPeerID) {
 			continue
 		}
 		body, ok := sanitizeChatBody(entry.Body)
 		if !ok && entry.Kind == "chat" {
 			continue
 		}
-		out = append(out, model.TranscriptEntry{
+		item := model.TranscriptEntry{
 			ID:           entry.ID,
-			SwarmID:      entry.SwarmID,
+			SwarmID:      swarmID,
 			Kind:         entry.Kind,
-			SenderPeerID: entry.SenderPeerID,
+			SenderPeerID: senderPeerID,
 			SenderName:   sanitizeDisplayName(entry.SenderName),
 			Body:         body,
 			SentAt:       clampEventTime(entry.SentAt),
-			Local:        entry.SenderPeerID == localPeerID,
-		})
+			Signature:    strings.TrimSpace(entry.Signature),
+			Local:        senderPeerID == localPeerID,
+		}
+		if !n.verifyTranscriptEntrySignature(item) {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -233,4 +268,26 @@ func clampWireTranscriptEntries(entries []wireTranscriptEntry) []wireTranscriptE
 		return entries[len(entries)-store.TranscriptLimit:]
 	}
 	return entries
+}
+
+func allowedTranscriptKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "chat", "join", "leave", "rename":
+		return true
+	default:
+		return false
+	}
+}
+
+func swarmHasTrustedPeerID(swarm model.Swarm, peerID string) bool {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return false
+	}
+	for _, trusted := range swarm.TrustedPeers {
+		if trusted.PeerID == peerID {
+			return true
+		}
+	}
+	return false
 }
