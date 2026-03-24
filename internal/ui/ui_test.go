@@ -1,6 +1,11 @@
 package ui
 
 import (
+	"image"
+	"image/color"
+	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -8,14 +13,17 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
 	"yap/internal/app"
+	"yap/internal/ascii"
 	"yap/internal/model"
 )
 
 func newTestComposer() textarea.Model {
 	composer := textarea.New()
+	composer.ShowLineNumbers = false
 	km := composer.KeyMap
 	km.InsertNewline = key.NewBinding(key.WithKeys("shift+enter"))
 	composer.KeyMap = km
@@ -59,6 +67,56 @@ func TestHandleChatShiftEnterInsertsNewline(t *testing.T) {
 
 	if got.composer.Value() != "\n" {
 		t.Fatalf("composer.Value() = %q, want newline", got.composer.Value())
+	}
+}
+
+func TestUpdatePasteMsgInsertsASCIIArtAtCursor(t *testing.T) {
+	t.Parallel()
+
+	composer := newTestComposer()
+	composer.SetValue("draft ")
+	path := writeUITestPNG(t, "sample.png", 2, 2, color.Gray{Y: 255})
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "composer",
+		width:    80,
+		state:    app.State{SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
+		composer: composer,
+	}
+
+	expectedArt, err := ascii.Convert(path, m.asciiPasteWidth())
+	if err != nil {
+		t.Fatalf("ascii.Convert() error = %v", err)
+	}
+
+	modelOut, _ := m.Update(tea.PasteMsg{Content: path})
+	got := modelOut.(*modelUI)
+
+	if got.composer.Value() != "draft "+expectedArt {
+		t.Fatalf("composer.Value() = %q, want %q", got.composer.Value(), "draft "+expectedArt)
+	}
+}
+
+func TestUpdatePasteMsgLeavesPathTextOutsideComposerFocus(t *testing.T) {
+	t.Parallel()
+
+	composer := newTestComposer()
+	path := writeUITestPNG(t, "sample.png", 2, 2, color.Gray{Y: 255})
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "peers",
+		width:    80,
+		state:    app.State{SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
+		composer: composer,
+	}
+
+	modelOut, _ := m.Update(tea.PasteMsg{Content: path})
+	got := modelOut.(*modelUI)
+
+	if got.composer.Value() != path {
+		t.Fatalf("composer.Value() = %q, want %q", got.composer.Value(), path)
 	}
 }
 
@@ -234,6 +292,44 @@ func TestConnectionSummaryReflectsPeerHealth(t *testing.T) {
 	}
 }
 
+func TestChatLayoutWidths(t *testing.T) {
+	t.Parallel()
+
+	mainWidth, sidebarWidth, contentWidth := chatLayoutWidths(80)
+	if mainWidth != 50 || sidebarWidth != 30 || contentWidth != 44 {
+		t.Fatalf("chatLayoutWidths(80) = (%d, %d, %d), want (50, 30, 44)", mainWidth, sidebarWidth, contentWidth)
+	}
+}
+
+func TestASCIIPasteWidthUsesTextareaInnerWidth(t *testing.T) {
+	t.Parallel()
+
+	composer := newTestComposer()
+	composer.SetWidth(44)
+
+	m := &modelUI{composer: composer}
+	if got := m.asciiPasteWidth(); got != 24 {
+		t.Fatalf("asciiPasteWidth() = %d, want %d", got, 24)
+	}
+}
+
+func TestASCIIPasteWidthRespectsTranscriptWidth(t *testing.T) {
+	t.Parallel()
+
+	composer := newTestComposer()
+	composer.SetWidth(60)
+	messages := viewport.New()
+	messages.SetWidth(30)
+
+	m := &modelUI{
+		composer: composer,
+		messages: messages,
+	}
+	if got := m.asciiPasteWidth(); got != 15 {
+		t.Fatalf("asciiPasteWidth() = %d, want %d", got, 15)
+	}
+}
+
 func TestRenderTranscriptDoesNotMarkLocalMessagesAsNew(t *testing.T) {
 	m := &modelUI{
 		state: app.State{
@@ -301,4 +397,27 @@ func TestApplyAppEventPreservesChatSidebarFocus(t *testing.T) {
 	if got, want := m.focus, "swarms"; got != want {
 		t.Fatalf("focus = %q, want %q", got, want)
 	}
+}
+
+func writeUITestPNG(t *testing.T, name string, width int, height int, fill color.Gray) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), name)
+	img := image.NewGray(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetGray(x, y, fill)
+		}
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("os.Create() error = %v", err)
+	}
+	defer file.Close()
+
+	if err := png.Encode(file, img); err != nil {
+		t.Fatalf("png.Encode() error = %v", err)
+	}
+	return path
 }

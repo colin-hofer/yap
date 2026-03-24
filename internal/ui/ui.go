@@ -17,6 +17,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"yap/internal/app"
+	"yap/internal/ascii"
 	"yap/internal/emoji"
 	"yap/internal/model"
 	"yap/internal/update"
@@ -344,6 +345,10 @@ func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		return m, nil
+	case tea.PasteMsg:
+		if m.handleImagePaste(msg.Content) {
+			return m, nil
+		}
 	case tea.KeyPressMsg:
 		if m.modal.Kind != "" {
 			return m.handleModal(msg)
@@ -884,15 +889,7 @@ func (m *modelUI) syncLayout() {
 		return
 	}
 	if m.mode == "chat" {
-		sidebarWidth := 26
-		chatWidth := m.width - sidebarWidth
-		if chatWidth < 30 {
-			chatWidth = m.width
-		}
-		contentWidth := chatWidth - 6
-		if contentWidth < 10 {
-			contentWidth = 10
-		}
+		_, _, contentWidth := chatLayoutWidths(m.width)
 		msgHeight := m.height - 12
 		if msgHeight < 4 {
 			msgHeight = 4
@@ -1059,16 +1056,7 @@ func (m *modelUI) renderChat(width, height int) string {
 			"  " + mutedStyle.Render(m.status),
 	)
 
-	sidebarWidth := 30
-	mainWidth := width - sidebarWidth
-	if mainWidth < 30 {
-		mainWidth = width
-		sidebarWidth = 0
-	}
-	contentWidth := mainWidth - 6
-	if contentWidth < 10 {
-		contentWidth = 10
-	}
+	mainWidth, sidebarWidth, contentWidth := chatLayoutWidths(width)
 	msgHeight := height - 12 // always reserve 1 line for typing indicator
 	// Reserve additional space for emoji picker above composer
 	emojiLines := m.emojiExtraLines()
@@ -1576,6 +1564,64 @@ func (m *modelUI) renderComposerArea() string {
 	}
 	parts = append(parts, m.composer.View())
 	return strings.Join(parts, "\n")
+}
+
+func (m *modelUI) handleImagePaste(content string) bool {
+	if m.mode != "chat" || m.modal.Kind != "" || m.focus != "composer" {
+		return false
+	}
+	art, err := ascii.Convert(strings.TrimSpace(content), m.asciiPasteWidth())
+	if err != nil {
+		return false
+	}
+	m.composer.InsertString(art)
+	m.updateComposerPlaceholder()
+	m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
+	m.refreshEmojiResults()
+	return true
+}
+
+func (m *modelUI) asciiPasteWidth() int {
+	usableWidth := m.composer.Width()
+	if transcriptWidth := m.messages.Width() - 2; transcriptWidth > 0 && (usableWidth <= 0 || transcriptWidth < usableWidth) {
+		usableWidth = transcriptWidth
+	}
+	if usableWidth <= 0 {
+		_, _, contentWidth := chatLayoutWidths(m.width)
+		usableWidth = contentWidth - lipgloss.Width(m.composer.Prompt) - 2
+	}
+	if usableWidth < 10 {
+		usableWidth = 10
+	}
+	width := max(usableWidth-2, 1)
+	width = width * 3 / 5
+	if width < 12 {
+		width = min(usableWidth, 12)
+	}
+	if width > 48 {
+		width = 48
+	}
+	if width > usableWidth {
+		width = usableWidth
+	}
+	return width
+}
+
+func chatLayoutWidths(totalWidth int) (mainWidth, sidebarWidth, contentWidth int) {
+	if totalWidth <= 0 {
+		totalWidth = 110
+	}
+	sidebarWidth = 30
+	mainWidth = totalWidth - sidebarWidth
+	if mainWidth < 30 {
+		mainWidth = totalWidth
+		sidebarWidth = 0
+	}
+	contentWidth = mainWidth - 6
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+	return mainWidth, sidebarWidth, contentWidth
 }
 
 func (m *modelUI) typingSummary() string {
