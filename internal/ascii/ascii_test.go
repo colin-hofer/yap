@@ -61,7 +61,7 @@ func TestFitRescalesArtAndTrimsTrailingSpaces(t *testing.T) {
 		"****    ",
 		"....    ",
 	}, "\n")
-	got := Fit(art, 2)
+	got := Fit(art, 4)
 	want := "@@\n**"
 	if got != want {
 		t.Fatalf("Fit() = %q, want %q", got, want)
