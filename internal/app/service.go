@@ -497,7 +497,7 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 	selected := s.selectedID == entry.SwarmID
 	swarmName := s.swarmNameLocked(entry.SwarmID)
 	mentioned := s.entryMentionsIdentityLocked(entry)
-	if !selected && len(added) > 0 && entry.Kind == "chat" {
+	if !selected && len(added) > 0 && entryAddsUnread(entry) {
 		s.unread[entry.SwarmID] += len(added)
 	}
 	s.mu.Unlock()
@@ -513,13 +513,25 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 			s.emitToast(err.Error())
 		}
 	}
-	if !selected && entry.Kind == "chat" && swarmName != "" {
-		if mentioned {
-			s.emitToast(fmt.Sprintf("mention in %s from %s", swarmName, entry.SenderName))
+	if !selected && swarmName != "" {
+		switch entry.Kind {
+		case "chat":
+			if entry.Local {
+				break
+			}
+			if mentioned {
+				s.emitToast(fmt.Sprintf("mention in %s from %s", swarmName, entry.SenderName))
+				return
+			}
+			s.emitToast(fmt.Sprintf("new message in %s from %s", swarmName, entry.SenderName))
+			return
+		case "rename":
+			if entry.Local {
+				break
+			}
+			s.emitToast(fmt.Sprintf("%s in %s", renameEntrySummary(entry), swarmName))
 			return
 		}
-		s.emitToast(fmt.Sprintf("new message in %s from %s", swarmName, entry.SenderName))
-		return
 	}
 	s.emitSync()
 }
@@ -541,7 +553,7 @@ func (s *Service) handleHistoryImport(swarmID string, entries []model.Transcript
 	s.transcriptLag[swarmID] = 0
 	s.lastActivity[swarmID] = activityTimeForEntries(s.lastActivity[swarmID], added)
 	if s.selectedID != swarmID {
-		s.unread[swarmID] += countChatEntries(added)
+		s.unread[swarmID] += countUnreadEntries(added)
 	}
 	s.mu.Unlock()
 	s.emitSync()
@@ -1016,14 +1028,41 @@ func mergeTranscriptEntries(existing, incoming []model.TranscriptEntry) ([]model
 	return merged, filtered
 }
 
-func countChatEntries(entries []model.TranscriptEntry) int {
+func countUnreadEntries(entries []model.TranscriptEntry) int {
 	count := 0
 	for _, entry := range entries {
-		if entry.Kind == "chat" {
+		if entryAddsUnread(entry) {
 			count++
 		}
 	}
 	return count
+}
+
+func entryAddsUnread(entry model.TranscriptEntry) bool {
+	if entry.Local {
+		return false
+	}
+	switch entry.Kind {
+	case "chat", "rename":
+		return true
+	default:
+		return false
+	}
+}
+
+func renameEntrySummary(entry model.TranscriptEntry) string {
+	oldName := strings.TrimSpace(entry.Body)
+	newName := strings.TrimSpace(entry.SenderName)
+	switch {
+	case oldName != "" && newName != "" && !strings.EqualFold(oldName, newName):
+		return fmt.Sprintf("%s is now %s", oldName, newName)
+	case newName != "":
+		return fmt.Sprintf("%s updated their name", newName)
+	case oldName != "":
+		return fmt.Sprintf("%s updated their name", oldName)
+	default:
+		return "a peer updated their name"
+	}
 }
 
 func mentionToken(name, peerID string) string {

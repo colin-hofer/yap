@@ -576,12 +576,17 @@ func (n *Node) Close() error {
 // UpdateIdentityName updates the local display name used for cards, presence,
 // and future chat messages.
 func (n *Node) UpdateIdentityName(name string) {
-	name = strings.TrimSpace(name)
+	name = sanitizeDisplayName(name)
 	if name == "" {
 		return
 	}
 
 	n.mu.Lock()
+	oldName := sanitizeDisplayName(n.identity.Name)
+	if name == oldName {
+		n.mu.Unlock()
+		return
+	}
 	n.identity.Name = name
 	active := make([]*activeSwarm, 0, len(n.active))
 	self := model.TrustedPeer{
@@ -612,6 +617,15 @@ func (n *Node) UpdateIdentityName(name string) {
 	n.mu.Unlock()
 
 	for _, session := range active {
+		env, err := n.newEnvelope(session, "rename", envelopeBody{Body: oldName}, "", time.Time{})
+		if err != nil {
+			n.emitSystem(fmt.Sprintf("failed to publish rename: %v", err))
+		} else if err := n.publishEnvelope(session, env); err != nil {
+			n.emitSystem(fmt.Sprintf("failed to publish rename: %v", err))
+		} else {
+			entry := transcriptEntryFromEnvelope(session.Swarm.ID, n.host.ID().String(), env, oldName, true)
+			n.emit(Event{Kind: EventTranscript, Entry: &entry})
+		}
 		n.emitPresenceSnapshot(session)
 		_ = n.publishKind(session, "heartbeat", "")
 	}
@@ -964,8 +978,8 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 		}
 		sentAt := clampEventTime(env.SentAt)
 		senderPeerID := author.String()
-		senderName := resolvedPeerName(active.Swarm, author, env.SenderName)
 		senderFingerprint := n.peerFingerprint(author)
+		previousName, senderName := n.syncTrustedPeerIdentity(active, author, env.SenderName, senderFingerprint, sentAt)
 
 		switch env.Kind {
 		case "chat":
@@ -1011,6 +1025,29 @@ func (n *Node) subscriptionLoop(active *activeSwarm) {
 				Name:        senderName,
 				Fingerprint: senderFingerprint,
 				State:       state,
+				LastSeen:    sentAt,
+				ClearTyping: true,
+			})
+		case "rename":
+			oldName := sanitizeDisplayName(payload.Body)
+			if oldName == "" {
+				oldName = previousName
+			}
+			entry := model.TranscriptEntry{
+				ID:           env.ID,
+				SwarmID:      active.Swarm.ID,
+				Kind:         "rename",
+				SenderPeerID: senderPeerID,
+				SenderName:   senderName,
+				Body:         oldName,
+				SentAt:       sentAt,
+			}
+			n.emit(Event{Kind: EventTranscript, Entry: &entry})
+			n.touchPresence(active, presenceRecord{
+				PeerID:      senderPeerID,
+				Name:        senderName,
+				Fingerprint: senderFingerprint,
+				State:       "online",
 				LastSeen:    sentAt,
 				ClearTyping: true,
 			})
@@ -1145,6 +1182,26 @@ func transcriptEntryFromEnvelope(swarmID string, senderPeerID string, env envelo
 		SentAt:       env.SentAt,
 		Local:        local,
 	}
+}
+
+func (n *Node) syncTrustedPeerIdentity(active *activeSwarm, author peer.ID, claimedName, fingerprint string, seenAt time.Time) (string, string) {
+	if active == nil || author == "" {
+		return "", ""
+	}
+	claimedName = sanitizeDisplayName(claimedName)
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	previousName := resolvedPeerName(active.Swarm, author, "")
+	active.Swarm.TrustedPeers = mergeTrustedPeer(active.Swarm.TrustedPeers, model.TrustedPeer{
+		PeerID:      author.String(),
+		Name:        claimedName,
+		Fingerprint: fingerprint,
+		LastSeen:    seenAt,
+	})
+	currentName := resolvedPeerName(active.Swarm, author, claimedName)
+	return previousName, currentName
 }
 
 func (n *Node) connectTrustedPeers(swarm model.Swarm) {

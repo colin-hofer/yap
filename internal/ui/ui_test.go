@@ -143,6 +143,35 @@ func TestHandleChatTabCompletesMentionBeforeChangingFocus(t *testing.T) {
 	}
 }
 
+func TestHandleChatTabCyclesFocusAcrossComposerPeersAndSwarms(t *testing.T) {
+	composer := newTestComposer()
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "composer",
+		state:    app.State{SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"}},
+		composer: composer,
+	}
+
+	modelOut, _ := m.handleChat(tea.KeyPressMsg{Code: tea.KeyTab})
+	got := modelOut.(*modelUI)
+	if got.focus != "peers" {
+		t.Fatalf("focus after first tab = %q, want peers", got.focus)
+	}
+
+	modelOut, _ = got.handleChat(tea.KeyPressMsg{Code: tea.KeyTab})
+	got = modelOut.(*modelUI)
+	if got.focus != "swarms" {
+		t.Fatalf("focus after second tab = %q, want swarms", got.focus)
+	}
+
+	modelOut, _ = got.handleChat(tea.KeyPressMsg{Code: tea.KeyTab})
+	got = modelOut.(*modelUI)
+	if got.focus != "composer" {
+		t.Fatalf("focus after third tab = %q, want composer", got.focus)
+	}
+}
+
 func TestRenderTranscriptShowsUnreadSeparator(t *testing.T) {
 	m := &modelUI{
 		state: app.State{
@@ -158,6 +187,31 @@ func TestRenderTranscriptShowsUnreadSeparator(t *testing.T) {
 
 	if !strings.Contains(content, "── new messages ──") {
 		t.Fatalf("renderTranscript() missing unread separator:\n%s", content)
+	}
+}
+
+func TestRenderTranscriptHidesJoinLeaveAndShowsRename(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+		},
+	}
+
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "join-1", Kind: "join", SenderPeerID: "peer-1", SenderName: "Peer", SentAt: time.Unix(10, 0)},
+		{ID: "rename-1", Kind: "rename", SenderPeerID: "peer-1", SenderName: "New Name", Body: "Old Name", SentAt: time.Unix(20, 0)},
+		{ID: "leave-1", Kind: "leave", SenderPeerID: "peer-1", SenderName: "New Name", SentAt: time.Unix(30, 0)},
+	}, 80)
+
+	if strings.Contains(content, "joined") {
+		t.Fatalf("renderTranscript() unexpectedly showed join event:\n%s", content)
+	}
+	if strings.Contains(content, "left") {
+		t.Fatalf("renderTranscript() unexpectedly showed leave event:\n%s", content)
+	}
+	if !strings.Contains(content, "Old Name is now") || !strings.Contains(content, "New Name") {
+		t.Fatalf("renderTranscript() missing rename entry:\n%s", content)
 	}
 }
 
@@ -215,5 +269,36 @@ func TestRenderTranscriptHighlightsMentionBadge(t *testing.T) {
 
 	if !strings.Contains(content, "@you") {
 		t.Fatalf("renderTranscript() missing mention badge:\n%s", content)
+	}
+}
+
+func TestApplyAppEventPreservesChatSidebarFocus(t *testing.T) {
+	composer := newTestComposer()
+	composer.Blur()
+
+	m := &modelUI{
+		mode:     "chat",
+		focus:    "swarms",
+		composer: composer,
+		state: app.State{
+			Version:       1,
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Swarms:        []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha"}, Connected: true}},
+		},
+	}
+
+	m.applyAppEvent(app.Event{
+		Type: app.EventSync,
+		Snapshot: app.State{
+			Version:       2,
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+			Swarms:        []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha"}, Connected: true}},
+		},
+	})
+
+	if got, want := m.focus, "swarms"; got != want {
+		t.Fatalf("focus = %q, want %q", got, want)
 	}
 }

@@ -182,6 +182,14 @@ func newModel(service *app.Service) *modelUI {
 		composer: composer,
 		prompt:   prompt,
 	}
+	if state.SelectedSwarm != nil {
+		for i := range state.Swarms {
+			if state.Swarms[i].Swarm.ID == state.SelectedSwarm.ID {
+				model.swarmIdx = i
+				break
+			}
+		}
+	}
 	return model
 }
 
@@ -225,6 +233,50 @@ func transitionTickCmd() tea.Cmd {
 	return tea.Tick(60*time.Millisecond, func(time.Time) tea.Msg {
 		return transitionTickMsg{}
 	})
+}
+
+func normalizeHomeFocus(focus string) string {
+	if focus == "nearby" {
+		return "nearby"
+	}
+	return "swarms"
+}
+
+func normalizeChatFocus(focus string) string {
+	switch focus {
+	case "peers", "swarms":
+		return focus
+	default:
+		return "composer"
+	}
+}
+
+func nextChatFocus(current string, forward bool) string {
+	order := []string{"composer", "peers", "swarms"}
+	current = normalizeChatFocus(current)
+	for i, focus := range order {
+		if focus != current {
+			continue
+		}
+		if forward {
+			return order[(i+1)%len(order)]
+		}
+		return order[(i+len(order)-1)%len(order)]
+	}
+	return "composer"
+}
+
+func (m *modelUI) setChatFocus(focus string) {
+	focus = normalizeChatFocus(focus)
+	if focus != "composer" && m.focus == "composer" {
+		m.notifyTyping(false)
+	}
+	m.focus = focus
+	if focus == "composer" {
+		m.composer.Focus()
+		return
+	}
+	m.composer.Blur()
 }
 
 func (m *modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -443,6 +495,13 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if msg.Code == tea.KeyTab && msg.Mod == tea.ModShift {
+		if !m.emojiActive() {
+			m.setChatFocus(nextChatFocus(m.focus, false))
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -499,6 +558,13 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.focus == "swarms" && m.swarmIdx > 0 {
+			m.swarmIdx--
+			return m, nil
+		}
+		if m.focus != "composer" {
+			return m, nil
+		}
 	case "down":
 		if m.emojiActive() {
 			if m.emojiIdx < len(m.emojiResults)-1 {
@@ -506,18 +572,41 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.focus == "swarms" && m.swarmIdx < len(m.state.Swarms)-1 {
+			m.swarmIdx++
+			return m, nil
+		}
+		if m.focus != "composer" {
+			return m, nil
+		}
 	case "tab":
 		if m.emojiActive() {
 			m.applyEmojiCompletion()
 			return m, nil
 		}
-		if m.applyMentionCompletion() {
+		if m.focus == "composer" && m.applyMentionCompletion() {
 			m.notifyTyping(strings.TrimSpace(m.composer.Value()) != "")
+			return m, nil
 		}
+		m.setChatFocus(nextChatFocus(m.focus, true))
 		return m, nil
 	case "enter":
 		if m.emojiActive() {
 			m.applyEmojiCompletion()
+			return m, nil
+		}
+		if m.focus == "swarms" {
+			swarm := m.selectedSwarm()
+			if swarm == nil {
+				m.status = "select a swarm first"
+				return m, nil
+			}
+			if err := m.service.OpenSwarm(swarm.Swarm.ID); err != nil {
+				m.status = err.Error()
+			}
+			return m, nil
+		}
+		if m.focus != "composer" {
 			return m, nil
 		}
 		body := strings.TrimSpace(m.composer.Value())
@@ -532,6 +621,9 @@ func (m *modelUI) handleChat(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.updateComposerPlaceholder()
 		m.notifyTyping(false)
 		m.syncTranscript(true)
+		return m, nil
+	}
+	if m.focus != "composer" {
 		return m, nil
 	}
 	// Everything else (including shift+enter for newline) goes to textarea.
@@ -684,16 +776,24 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 		}
 		prevState := m.state
 		prevMode := m.mode
+		prevFocus := m.focus
 		prevSwarmID := m.highlightedSwarmID()
 		prevNearbyID := m.highlightedNearbyID()
 		m.state = event.Snapshot
 		if m.state.SelectedSwarm != nil {
 			m.mode = "chat"
-			m.focus = "composer"
-			m.composer.Focus()
+			if prevMode == "chat" {
+				m.setChatFocus(prevFocus)
+			} else {
+				m.setChatFocus("composer")
+			}
 		} else {
 			m.mode = "home"
-			m.focus = "swarms"
+			if prevMode == "home" {
+				m.focus = normalizeHomeFocus(prevFocus)
+			} else {
+				m.focus = "swarms"
+			}
 			m.composer.Blur()
 		}
 		m.restoreHighlightedSwarm(prevSwarmID)
@@ -959,7 +1059,7 @@ func (m *modelUI) renderChat(width, height int) string {
 			"  " + mutedStyle.Render(m.status),
 	)
 
-	sidebarWidth := 26
+	sidebarWidth := 30
 	mainWidth := width - sidebarWidth
 	if mainWidth < 30 {
 		mainWidth = width
@@ -986,10 +1086,7 @@ func (m *modelUI) renderChat(width, height int) string {
 	}
 	panelHeight := msgHeight + 5 + emojiLines + newMsgLine // +5 = composer(3) + gap(1) + typing(1)
 
-	mainStyle := focusedPanelStyle
-	if m.transitionFrame > 0 {
-		mainStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.transitionBorderColor()).Padding(1, 2)
-	}
+	mainStyle := m.chatPanelStyle("composer")
 
 	var chatContent string
 	if m.hasNewBelow && !m.messages.AtBottom() {
@@ -1002,12 +1099,23 @@ func (m *modelUI) renderChat(width, height int) string {
 
 	body := main
 	if sidebarWidth > 0 {
-		sideStyle := panelStyle
-		if m.transitionFrame > 0 {
-			sideStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.transitionBorderColor()).Padding(1, 2)
+		peersHeight := panelHeight / 2
+		if peersHeight < 8 {
+			peersHeight = 8
 		}
-		peers := sideStyle.Width(sidebarWidth).Height(panelHeight).Render(m.renderPresence())
-		body = lipgloss.JoinHorizontal(lipgloss.Top, main, peers)
+		swarmsHeight := panelHeight - peersHeight
+		if swarmsHeight < 8 {
+			swarmsHeight = 8
+			peersHeight = panelHeight - swarmsHeight
+			if peersHeight < 8 {
+				peersHeight = panelHeight / 2
+				swarmsHeight = panelHeight - peersHeight
+			}
+		}
+		peers := m.chatPanelStyle("peers").Width(sidebarWidth).Height(peersHeight).Render(m.renderPresence())
+		swarms := m.chatPanelStyle("swarms").Width(sidebarWidth).Height(swarmsHeight).Render(m.renderChatSwarms())
+		sidebar := lipgloss.JoinVertical(lipgloss.Left, peers, swarms)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, main, sidebar)
 	}
 
 	footer := lipgloss.NewStyle().Padding(0, 2).Width(width).Render(
@@ -1015,6 +1123,16 @@ func (m *modelUI) renderChat(width, height int) string {
 	)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m *modelUI) chatPanelStyle(target string) lipgloss.Style {
+	if m.transitionFrame > 0 {
+		return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.transitionBorderColor()).Padding(1, 2)
+	}
+	if m.focus == target {
+		return focusedPanelStyle
+	}
+	return panelStyle
 }
 
 func (m *modelUI) renderPresence() string {
@@ -1053,6 +1171,52 @@ func (m *modelUI) renderPresence() string {
 	return strings.Join(lines, "\n")
 }
 
+func (m *modelUI) renderChatSwarms() string {
+	var lines []string
+	lines = append(lines, titleStyle.Render("Swarms"))
+	if len(m.state.Swarms) == 0 {
+		lines = append(lines, "", mutedStyle.Render("No swarms yet."))
+		return strings.Join(lines, "\n")
+	}
+
+	currentID := selectedSwarmID(m.state)
+	for i, swarm := range m.state.Swarms {
+		selected := i == m.swarmIdx && m.focus == "swarms"
+		current := swarm.Swarm.ID == currentID
+
+		dot := "●"
+		if !swarm.Connected {
+			dot = "○"
+		}
+		name := truncate(swarm.Swarm.Name, 16)
+		unreadText := ""
+		if swarm.Unread > 0 {
+			unreadText = fmt.Sprintf(" %d", swarm.Unread)
+		}
+		marker := " "
+		if current {
+			marker = "›"
+		}
+		plain := fmt.Sprintf("%s %s %s%s", marker, dot, name, unreadText)
+
+		if selected {
+			lines = append(lines, "", selectedStyle.Render(plain))
+			continue
+		}
+
+		prefix := mutedStyle.Render("  ")
+		if current {
+			prefix = accentStyle.Render("› ")
+		}
+		label := prefix + swarmDot(swarm) + lipgloss.NewStyle().Foreground(colorStrong).Render(name)
+		if swarm.Unread > 0 {
+			label += accentStyle.Render(unreadText)
+		}
+		lines = append(lines, "", label)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m *modelUI) renderTranscript(entries []model.TranscriptEntry, width int) string {
 	rendered := m.renderTranscriptView(entries, width)
 	return strings.Join(rendered.Lines, "\n")
@@ -1075,10 +1239,8 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 		lastOpened = m.state.SelectedSwarm.LastOpened
 	}
 	for _, entry := range entries {
-		if entry.Kind != "chat" && entry.Kind != "join" && entry.Kind != "leave" {
-			if strings.TrimSpace(entry.Body) == "" {
-				continue
-			}
+		if !shouldRenderTranscriptEntry(entry) {
+			continue
 		}
 
 		// Consecutive chat messages from the same sender get collapsed.
@@ -1204,10 +1366,32 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle 
 	return strings.Join(lines, "\n")
 }
 
+func renderRenameEntry(entry model.TranscriptEntry) string {
+	ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
+	sep := mutedStyle.Render(" · ")
+	oldName := strings.TrimSpace(entry.Body)
+	newName := strings.TrimSpace(entry.SenderName)
+	renameStyle := lipgloss.NewStyle().Foreground(colorAccent2)
+	renameStrong := renameStyle.Bold(true)
+
+	switch {
+	case oldName != "" && newName != "" && !strings.EqualFold(oldName, newName):
+		return ts + sep + renameStyle.Render("↻ "+oldName+" is now ") + renameStrong.Render(newName)
+	case newName != "":
+		return ts + sep + renameStyle.Render("↻ "+newName+" updated their name")
+	case oldName != "":
+		return ts + sep + renameStyle.Render("↻ "+oldName+" updated their name")
+	default:
+		return ts + sep + renameStyle.Render("↻ a peer updated their name")
+	}
+}
+
 func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, selfHandle string) string {
 	switch entry.Kind {
 	case "chat":
 		return renderChatEntry(entry, continuation, selfHandle)
+	case "rename":
+		return renderRenameEntry(entry)
 	case "join":
 		return lipgloss.NewStyle().Foreground(colorJoin).Render("→ " + entry.SenderName + " joined")
 	case "leave":
@@ -1217,6 +1401,17 @@ func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, selfH
 			return mutedStyle.Render(entry.Body)
 		}
 		return ""
+	}
+}
+
+func shouldRenderTranscriptEntry(entry model.TranscriptEntry) bool {
+	switch entry.Kind {
+	case "join", "leave":
+		return false
+	case "chat", "rename":
+		return true
+	default:
+		return strings.TrimSpace(entry.Body) != ""
 	}
 }
 
@@ -1257,12 +1452,19 @@ func (m *modelUI) homeFooterHelp() string {
 }
 
 func (m *modelUI) chatFooterHelp() string {
-	parts := []string{"enter send", "tab @mention", "/e emoji"}
-	if m.keyDisambiguation {
-		parts = append(parts, "shift+enter newline")
+	switch m.focus {
+	case "peers":
+		return "tab swarms · shift+tab composer · pgup/pgdn scroll · esc back"
+	case "swarms":
+		return "↑↓ select swarm · enter open swarm · tab composer · pgup/pgdn scroll · esc back"
+	default:
+		parts := []string{"enter send", "tab mention/focus", "/e emoji"}
+		if m.keyDisambiguation {
+			parts = append(parts, "shift+enter newline")
+		}
+		parts = append(parts, "pgup/pgdn scroll", "esc back")
+		return strings.Join(parts, " · ")
 	}
-	parts = append(parts, "pgup/pgdn scroll", "esc back")
-	return strings.Join(parts, " · ")
 }
 
 func swarmDot(swarm app.SwarmSummary) string {

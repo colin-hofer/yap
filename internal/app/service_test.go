@@ -364,3 +364,44 @@ func TestHandleTranscriptEventEmitsMentionToastForBackgroundMessages(t *testing.
 		t.Fatal("expected mention toast event")
 	}
 }
+
+func TestHandleTranscriptEventEmitsToastAndUnreadForBackgroundRename(t *testing.T) {
+	svc := &Service{
+		ctx:          context.Background(),
+		identity:     model.Identity{Name: "me", PeerID: "self"},
+		swarms:       []model.Swarm{{ID: "swarm-1", Name: "Alpha"}},
+		nearby:       make(map[string]model.NearbyPeer),
+		transcripts:  make(map[string][]model.TranscriptEntry),
+		presence:     make(map[string][]model.Presence),
+		unread:       make(map[string]int),
+		connected:    map[string]bool{"swarm-1": true},
+		lastActivity: make(map[string]time.Time),
+		events:       make(chan Event, 8),
+	}
+
+	svc.handleTranscriptEvent(model.TranscriptEntry{
+		ID:           "rename-1",
+		SwarmID:      "swarm-1",
+		Kind:         "rename",
+		SenderPeerID: "peer-1",
+		SenderName:   "New Name",
+		Body:         "Old Name",
+		SentAt:       time.Unix(10, 0),
+	}, false)
+
+	if got, want := svc.unread["swarm-1"], 1; got != want {
+		t.Fatalf("unread = %d, want %d", got, want)
+	}
+
+	select {
+	case event := <-svc.events:
+		if event.Type != EventToast {
+			t.Fatalf("event.Type = %q, want %q", event.Type, EventToast)
+		}
+		if got, want := event.Message, "Old Name is now New Name in Alpha"; got != want {
+			t.Fatalf("event.Message = %q, want %q", got, want)
+		}
+	default:
+		t.Fatal("expected rename toast event")
+	}
+}

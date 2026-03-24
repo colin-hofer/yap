@@ -61,6 +61,38 @@ func TestTranscriptEntryFromEnvelopeUsesEnvelopeMetadata(t *testing.T) {
 	}
 }
 
+func TestSyncTrustedPeerIdentityUpdatesActiveSwarmName(t *testing.T) {
+	author := peer.ID("peer-1")
+	node := &Node{}
+	active := &activeSwarm{
+		Swarm: model.Swarm{
+			ID:   "swarm-1",
+			Name: "Alpha",
+			TrustedPeers: []model.TrustedPeer{
+				{PeerID: author.String(), Name: "Old Name"},
+			},
+		},
+	}
+
+	previous, current := node.syncTrustedPeerIdentity(active, author, "New Name", "fp-1", time.Unix(20, 0))
+
+	if got, want := previous, "Old Name"; got != want {
+		t.Fatalf("previous = %q, want %q", got, want)
+	}
+	if got, want := current, "New Name"; got != want {
+		t.Fatalf("current = %q, want %q", got, want)
+	}
+	if got, want := active.Swarm.TrustedPeers[0].Name, "New Name"; got != want {
+		t.Fatalf("active.Swarm.TrustedPeers[0].Name = %q, want %q", got, want)
+	}
+	if got, want := active.Swarm.TrustedPeers[0].Fingerprint, "fp-1"; got != want {
+		t.Fatalf("active.Swarm.TrustedPeers[0].Fingerprint = %q, want %q", got, want)
+	}
+	if got, want := active.Swarm.TrustedPeers[0].LastSeen, time.Unix(20, 0); !got.Equal(want) {
+		t.Fatalf("active.Swarm.TrustedPeers[0].LastSeen = %v, want %v", got, want)
+	}
+}
+
 func TestRefreshNearbyPrunesExpiredPeersAndEmitsSnapshot(t *testing.T) {
 	node := &Node{
 		ctx:              context.Background(),
