@@ -1245,7 +1245,7 @@ func (m *modelUI) renderTranscriptView(entries []model.TranscriptEntry, width in
 			insertedUnread = true
 		}
 
-		lines = append(lines, strings.Split(renderTranscriptEntry(entry, sameSender, m.selfMentionHandle()), "\n")...)
+		lines = append(lines, strings.Split(renderTranscriptEntry(entry, sameSender, m.selfMentionHandle(), width), "\n")...)
 
 		if entry.Kind == "chat" {
 			prevSender = entry.SenderPeerID
@@ -1324,7 +1324,7 @@ func (m *modelUI) selectedNearby() *model.NearbyPeer {
 	return &peerInfo
 }
 
-func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle string) string {
+func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle string, width int) string {
 	nameStyle := lipgloss.NewStyle().Foreground(colorPeer).Bold(true)
 	bodyStyle := lipgloss.NewStyle().Foreground(colorPeer)
 	if entry.Local {
@@ -1337,12 +1337,12 @@ func renderChatEntry(entry model.TranscriptEntry, continuation bool, selfHandle 
 	}
 	var raw string
 	if continuation {
-		raw = renderChatBody(entry.Body, bodyStyle, selfHandle)
+		raw = renderChatBody(entry.Body, bodyStyle, selfHandle, width-2)
 	} else {
 		ts := mutedStyle.Render(entry.SentAt.Format("15:04"))
 		sep := mutedStyle.Render(" · ")
 		header := ts + sep + nameStyle.Render(entry.SenderName) + mentionBadge
-		raw = header + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle)
+		raw = header + "\n" + renderChatBody(entry.Body, bodyStyle, selfHandle, width-2)
 	}
 	// Apply gradient left border
 	lines := strings.Split(raw, "\n")
@@ -1374,10 +1374,10 @@ func renderRenameEntry(entry model.TranscriptEntry) string {
 	}
 }
 
-func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, selfHandle string) string {
+func renderTranscriptEntry(entry model.TranscriptEntry, continuation bool, selfHandle string, width int) string {
 	switch entry.Kind {
 	case "chat":
-		return renderChatEntry(entry, continuation, selfHandle)
+		return renderChatEntry(entry, continuation, selfHandle, width)
 	case "rename":
 		return renderRenameEntry(entry)
 	case "join":
@@ -1817,7 +1817,18 @@ func mentionsHandle(body, handle string) bool {
 	return false
 }
 
-func renderChatBody(body string, bodyStyle lipgloss.Style, selfHandle string) string {
+func renderChatBody(body string, bodyStyle lipgloss.Style, selfHandle string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if ascii.LooksLikeArt(body) {
+		art := ascii.Fit(body, width)
+		lines := strings.Split(art, "\n")
+		for i, line := range lines {
+			lines[i] = bodyStyle.Render(line)
+		}
+		return strings.Join(lines, "\n")
+	}
 	// Split on code blocks (```) first
 	parts := strings.Split(body, "```")
 	var out strings.Builder

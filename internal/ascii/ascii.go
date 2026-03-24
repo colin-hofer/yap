@@ -7,6 +7,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -71,6 +72,86 @@ func Convert(path string, width int) (string, error) {
 	}
 
 	return buf.String(), nil
+}
+
+// LooksLikeArt reports whether the text appears to be generated ASCII art
+// using the package's luminance ramp.
+func LooksLikeArt(text string) bool {
+	lines := strings.Split(strings.Trim(text, "\n"), "\n")
+	if len(lines) < 3 {
+		return false
+	}
+	seenInk := false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			return false
+		}
+		for _, r := range line {
+			if !strings.ContainsRune(charRamp, r) {
+				return false
+			}
+			if r != ' ' {
+				seenInk = true
+			}
+		}
+	}
+	return seenInk
+}
+
+// Fit rescales ASCII art to fit the requested width and trims trailing spaces
+// from each rendered line to avoid invisible wrap fragments in the viewport.
+func Fit(text string, width int) string {
+	lines := strings.Split(strings.Trim(text, "\n"), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	sourceWidth := 0
+	grid := make([][]rune, len(lines))
+	for i, line := range lines {
+		grid[i] = []rune(line)
+		if len(grid[i]) > sourceWidth {
+			sourceWidth = len(grid[i])
+		}
+	}
+	if sourceWidth == 0 {
+		return ""
+	}
+	if width <= 0 {
+		width = sourceWidth
+	}
+	if width > sourceWidth {
+		width = sourceWidth
+	}
+
+	sourceHeight := len(grid)
+	targetHeight := sourceHeight
+	if width < sourceWidth {
+		targetHeight = int(math.Round(float64(sourceHeight) * float64(width) / float64(sourceWidth)))
+		if targetHeight < 1 {
+			targetHeight = 1
+		}
+	}
+
+	var out strings.Builder
+	for y := 0; y < targetHeight; y++ {
+		srcY := y * sourceHeight / targetHeight
+		row := grid[srcY]
+		var line strings.Builder
+		for x := 0; x < width; x++ {
+			srcX := x * sourceWidth / width
+			if srcX < len(row) {
+				line.WriteRune(row[srcX])
+			} else {
+				line.WriteByte(' ')
+			}
+		}
+		rendered := strings.TrimRight(line.String(), " ")
+		out.WriteString(rendered)
+		if y < targetHeight-1 {
+			out.WriteByte('\n')
+		}
+	}
+	return out.String()
 }
 
 func cleanPath(path string) string {

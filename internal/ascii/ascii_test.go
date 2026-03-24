@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -36,6 +37,34 @@ func TestCleanPathUnwrapsQuotedEscapedAndFileURIPaths(t *testing.T) {
 
 	if got := cleanPath(`"file:///tmp/My%20Image.png"`); got != "/tmp/My Image.png" {
 		t.Fatalf("cleanPath() = %q, want %q", got, "/tmp/My Image.png")
+	}
+}
+
+func TestLooksLikeArt(t *testing.T) {
+	t.Parallel()
+
+	art := "@@@\n***\n..."
+	if !LooksLikeArt(art) {
+		t.Fatalf("LooksLikeArt() = false, want true")
+	}
+	if LooksLikeArt("hello\nworld\nagain") {
+		t.Fatalf("LooksLikeArt() = true, want false")
+	}
+}
+
+func TestFitRescalesArtAndTrimsTrailingSpaces(t *testing.T) {
+	t.Parallel()
+
+	art := strings.Join([]string{
+		"@@@@    ",
+		"####    ",
+		"****    ",
+		"....    ",
+	}, "\n")
+	got := Fit(art, 2)
+	want := "@@\n**"
+	if got != want {
+		t.Fatalf("Fit() = %q, want %q", got, want)
 	}
 }
 

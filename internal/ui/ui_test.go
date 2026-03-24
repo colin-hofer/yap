@@ -15,6 +15,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"yap/internal/app"
 	"yap/internal/ascii"
@@ -365,6 +366,34 @@ func TestRenderTranscriptHighlightsMentionBadge(t *testing.T) {
 
 	if !strings.Contains(content, "@you") {
 		t.Fatalf("renderTranscript() missing mention badge:\n%s", content)
+	}
+}
+
+func TestRenderTranscriptPreservesAndFitsASCIIArt(t *testing.T) {
+	m := &modelUI{
+		state: app.State{
+			Identity:      model.Identity{Name: "me", PeerID: "self"},
+			SelectedSwarm: &model.Swarm{ID: "swarm-1", Name: "Alpha"},
+		},
+	}
+
+	art := strings.Join([]string{
+		"****    ",
+		"####    ",
+		"....    ",
+		"%%%%    ",
+	}, "\n")
+	content := m.renderTranscript([]model.TranscriptEntry{
+		{ID: "msg-1", Kind: "chat", SenderPeerID: "self", SenderName: "A", Body: art, Local: true, SentAt: time.Unix(20, 0)},
+	}, 12)
+
+	if !strings.Contains(content, "**") {
+		t.Fatalf("renderTranscript() lost ascii art characters:\n%s", content)
+	}
+	for _, line := range strings.Split(content, "\n") {
+		if lipgloss.Width(line) > 12 {
+			t.Fatalf("line width = %d, want <= 12:\n%s", lipgloss.Width(line), content)
+		}
 	}
 }
 
