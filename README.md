@@ -5,42 +5,42 @@
 ## Install
 
 <!-- BEGIN GENERATED INSTALL -->
-Current release: `v0.1.17`
+Current release: `v1.0.0`
 
 Linux (`amd64`):
 
 ```bash
-VERSION=v0.1.17; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v1.0.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 Linux (`arm64`):
 
 ```bash
-VERSION=v0.1.17; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v1.0.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_linux_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 macOS (Apple Silicon):
 
 ```bash
-VERSION=v0.1.17; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v1.0.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_arm64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 macOS (Intel):
 
 ```bash
-VERSION=v0.1.17; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
+VERSION=v1.0.0; mkdir -p ~/.local/bin && curl -L https://github.com/colin-hofer/yap/releases/download/${VERSION}/yap_${VERSION#v}_darwin_amd64.tar.gz | tar -xz -C /tmp && install -m 755 /tmp/yap ~/.local/bin/yap
 ```
 
 Windows (`PowerShell`, `amd64`):
 
 ```powershell
-$version='v0.1.17'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_amd64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
+$version='v1.0.0'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_amd64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
 ```
 
 Windows (`PowerShell`, `arm64`):
 
 ```powershell
-$version='v0.1.17'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_arm64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
+$version='v1.0.0'; $dir="$HOME\AppData\Local\yap"; New-Item -ItemType Directory -Force -Path $dir | Out-Null; Invoke-WebRequest "https://github.com/colin-hofer/yap/releases/download/$version/yap_$($version.TrimStart('v'))_windows_arm64.zip" -OutFile "$dir\yap.zip"; Expand-Archive -Path "$dir\yap.zip" -DestinationPath $dir -Force
 ```
 
 After install, make sure the install directory is on your `PATH`:
