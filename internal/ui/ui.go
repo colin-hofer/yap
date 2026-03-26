@@ -508,18 +508,10 @@ func (m *modelUI) handleHome(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			SwarmName: swarm.Swarm.Name,
 		}
 	case "j":
-		if m.focus != "nearby" {
-			m.status = "focus nearby to join with a code"
-			return m, nil
-		}
-		if m.selectedNearby() == nil {
-			m.status = "select a nearby peer first"
-			return m, nil
-		}
 		m.prompt.SetValue("")
-		m.prompt.Placeholder = "Invite code"
+		m.prompt.Placeholder = "Invite code or token"
 		m.prompt.Focus()
-		m.modal = modalState{Kind: "join", Title: "Join Swarm", Message: "Enter the invite code from a nearby peer."}
+		m.modal = modalState{Kind: "join", Title: "Join Swarm", Message: "Enter a nearby invite code or a WAN invite token."}
 	case "u":
 		if m.checkingUpdate {
 			return m, nil
@@ -919,17 +911,24 @@ func (m *modelUI) handleJoinModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.dismissModal()
 		return m, nil
 	case "enter":
-		peerInfo := m.selectedNearby()
-		if peerInfo == nil {
-			m.status = "select a nearby peer first"
-			return m, nil
+		var peerInfo *model.NearbyPeer
+		if m.focus == "nearby" {
+			peerInfo = m.selectedNearby()
 		}
-		if err := m.service.StartPair(peerInfo.PeerID, m.prompt.Value(), false); err != nil {
+		selectedPeerID := ""
+		if peerInfo != nil {
+			selectedPeerID = peerInfo.PeerID
+		}
+		if err := m.service.StartJoin(selectedPeerID, m.prompt.Value(), false); err != nil {
 			m.status = err.Error()
 			return m, nil
 		}
 		m.dismissModal()
-		m.status = fmt.Sprintf("pairing with %s", nearbyLabel(*peerInfo))
+		if peerInfo != nil {
+			m.status = fmt.Sprintf("pairing with %s", nearbyLabel(*peerInfo))
+		} else {
+			m.status = "joining from invite"
+		}
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -1019,10 +1018,10 @@ func (m *modelUI) applyAppEvent(event app.Event) tea.Cmd {
 			m.state = event.Snapshot
 		}
 		title := "Invite Ready"
-		message := "Share this code with a nearby peer."
+		message := "Share this invite with a nearby or remote peer."
 		if event.Invite != nil {
 			title = "Invite " + event.Invite.SwarmName
-			message = fmt.Sprintf("Share this code to invite someone into %s.", event.Invite.SwarmName)
+			message = fmt.Sprintf("Share this invite to add someone to %s.", event.Invite.SwarmName)
 		}
 		m.pushModal(modalState{
 			Kind:    "invite",
@@ -1558,7 +1557,7 @@ func (m *modelUI) modalBody() string {
 	case "invite":
 		if m.modal.Invite != nil {
 			lines = append(lines, "")
-			lines = append(lines, accentStyle.Render(m.modal.Invite.Code))
+			lines = append(lines, accentStyle.Render(inviteShareText(*m.modal.Invite)))
 			lines = append(lines, mutedStyle.Render("expires "+m.modal.Invite.ExpiresAt.Format(time.Kitchen)))
 		}
 		lines = append(lines, "")
@@ -1692,11 +1691,18 @@ func shouldRenderTranscriptEntry(entry model.TranscriptEntry) bool {
 }
 
 func copyInviteCmd(invite model.Invite) tea.Cmd {
-	status := "copied invite code"
+	status := "copied invite"
 	if strings.TrimSpace(invite.SwarmName) != "" {
-		status = "copied invite code for " + invite.SwarmName
+		status = "copied invite for " + invite.SwarmName
 	}
-	return copyTextCmd(invite.Code, status)
+	return copyTextCmd(inviteShareText(invite), status)
+}
+
+func inviteShareText(invite model.Invite) string {
+	if text := strings.TrimSpace(invite.ShareToken); text != "" {
+		return text
+	}
+	return strings.TrimSpace(invite.Code)
 }
 
 func copyTextCmd(text, status string) tea.Cmd {
@@ -1719,7 +1725,7 @@ func (m *modelUI) homeFooterHelp() string {
 		if w > 0 && w < 80 {
 			return "tab swarms · ↑↓ select · n new · j join · v info\nr rename · u update · q quit"
 		}
-		return "tab swarms · ↑↓ select · n new swarm · j join selected nearby · v info · r rename self · u update · q quit"
+		return "tab swarms · ↑↓ select · n new swarm · j join invite · v info · r rename self · u update · q quit"
 	}
 	if w > 0 && w < 100 {
 		return "tab nearby · ↑↓ select · enter open · n new · r rename\nv info · i invite · R rotate · d remove · u update · q quit"

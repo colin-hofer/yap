@@ -142,8 +142,9 @@ func TestHandleHomeInviteRequiresSwarmFocus(t *testing.T) {
 
 func TestHandleHomeJoinRequiresNearbyFocus(t *testing.T) {
 	m := &modelUI{
-		mode:  "home",
-		focus: "swarms",
+		mode:   "home",
+		focus:  "swarms",
+		prompt: textinput.New(),
 		state: app.State{
 			Identity: model.Identity{Name: "me"},
 			Swarms:   []app.SwarmSummary{{Swarm: model.Swarm{ID: "swarm-1", Name: "Alpha"}}},
@@ -154,8 +155,11 @@ func TestHandleHomeJoinRequiresNearbyFocus(t *testing.T) {
 	modelOut, _ := m.handleHome(tea.KeyPressMsg{Code: 'j', Text: "j"})
 	got := modelOut.(*modelUI)
 
-	if got.status != "focus nearby to join with a code" {
-		t.Fatalf("status = %q", got.status)
+	if got.modal.Kind != "join" {
+		t.Fatalf("modal.Kind = %q, want join", got.modal.Kind)
+	}
+	if got.prompt.Placeholder != "Invite code or token" {
+		t.Fatalf("prompt.Placeholder = %q", got.prompt.Placeholder)
 	}
 }
 

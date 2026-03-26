@@ -23,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	ma "github.com/multiformats/go-multiaddr"
 
 	yapcrypto "yap/internal/crypto"
@@ -53,6 +54,9 @@ const (
 	historyStreamTimeout = 15 * time.Second
 	typingEvery          = 3 * time.Second
 	typingExpireAfter    = 6 * time.Second
+	relayRetryEvery      = 15 * time.Second
+	relayRefreshLead     = 1 * time.Minute
+	relayMinRefresh      = 30 * time.Second
 	maxDisplayNameBytes  = 64
 	maxChatBodyBytes     = 4096
 	maxPeerAddrs         = 16
@@ -150,6 +154,8 @@ type Node struct {
 	swarmSync        map[string]swarmSyncRecord
 	typingSent       map[string]time.Time
 	typingState      map[string]bool
+	relay            *configuredRelay
+	relayAddrs       []string
 }
 
 type nearbyCandidate struct {
@@ -170,6 +176,10 @@ type activeSwarm struct {
 	Context  context.Context
 	Cancel   context.CancelFunc
 	Presence map[string]*presenceRecord
+}
+
+type configuredRelay struct {
+	Info peer.AddrInfo
 }
 
 type swarmSyncRecord struct {
@@ -250,6 +260,12 @@ type envelopeBody struct {
 func New(parent context.Context, identity model.Identity, st *store.Store) (*Node, error) {
 	ctx, cancel := context.WithCancel(parent)
 
+	relayCfg, err := configuredRelayFromEnv()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
 	privateKeyBytes, err := corecrypto.ConfigDecodeKey(identity.PrivateKey)
 	if err != nil {
 		cancel()
@@ -303,6 +319,7 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 		swarmSync:        make(map[string]swarmSyncRecord),
 		typingSent:       make(map[string]time.Time),
 		typingState:      make(map[string]bool),
+		relay:            relayCfg,
 	}
 
 	h.SetStreamHandler(cardProtocolID, node.handleCardStream)
@@ -318,6 +335,9 @@ func New(parent context.Context, identity model.Identity, st *store.Store) (*Nod
 
 	go node.inviteJanitor()
 	go node.nearbyLoop()
+	if node.relay != nil {
+		go node.relayLoop()
+	}
 
 	return node, nil
 }
@@ -358,6 +378,7 @@ func (n *Node) CreateInvite(swarm model.Swarm) (model.Invite, error) {
 	}
 	invite := model.Invite{
 		Code:       code,
+		ShareToken: yapcrypto.FormatInviteToken(n.host.ID().String(), code),
 		SwarmID:    swarm.ID,
 		SwarmName:  swarm.Name,
 		ExpiresAt:  time.Now().Add(inviteTTL),
@@ -412,6 +433,26 @@ func (n *Node) PairWithPeer(peerID, code string, autoOpen bool) error {
 		return fmt.Errorf("decode peer id: %w", err)
 	}
 	go n.runOutgoingPair(id, code, autoOpen)
+	return nil
+}
+
+// PairWithInviteToken starts a pairing flow using a shareable invite token.
+func (n *Node) PairWithInviteToken(token string, autoOpen bool) error {
+	parsed, err := yapcrypto.ParseInviteToken(token)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(parsed.PeerID) == "" {
+		return fmt.Errorf("invite token does not include an inviter peer")
+	}
+	id, err := peer.Decode(parsed.PeerID)
+	if err != nil {
+		return fmt.Errorf("decode inviter peer id: %w", err)
+	}
+	if !n.prepareRelayPeer(id) {
+		return fmt.Errorf("YAP_RELAY_ADDR is not configured")
+	}
+	go n.runOutgoingPair(id, parsed.Code, autoOpen)
 	return nil
 }
 
@@ -632,6 +673,11 @@ func (n *Node) UpdateIdentityName(name string) {
 		return
 	}
 
+	selfAddrs := uniqueStrings(append(
+		sanitizePeerAddrs(multiaddrStrings(n.host.Addrs())),
+		n.currentRelayAddrs()...,
+	))
+
 	n.mu.Lock()
 	oldName := sanitizeDisplayName(n.identity.Name)
 	if name == oldName {
@@ -644,7 +690,7 @@ func (n *Node) UpdateIdentityName(name string) {
 		PeerID:      n.host.ID().String(),
 		Name:        name,
 		Fingerprint: n.identity.Fingerprint,
-		Addrs:       multiaddrStrings(n.host.Addrs()),
+		Addrs:       sanitizePeerAddrs(selfAddrs),
 		LastSeen:    time.Now(),
 	}
 	for _, session := range n.active {
@@ -1507,22 +1553,11 @@ func (n *Node) connectTrustedPeers(swarm model.Swarm) {
 		if trusted.PeerID == n.host.ID().String() {
 			continue
 		}
-		id, err := peer.Decode(trusted.PeerID)
-		if err != nil {
+		info, ok := n.addrInfoForTrustedPeer(trusted)
+		if !ok || len(info.Addrs) == 0 {
 			continue
 		}
-		addrs := make([]ma.Multiaddr, 0, len(trusted.Addrs))
-		for _, raw := range trusted.Addrs {
-			addr, err := ma.NewMultiaddr(raw)
-			if err != nil {
-				continue
-			}
-			addrs = append(addrs, addr)
-		}
-		if len(addrs) == 0 {
-			continue
-		}
-		info := peer.AddrInfo{ID: id, Addrs: addrs}
+		n.prepareRelayPeer(info.ID)
 		n.host.Peerstore().AddAddrs(info.ID, info.Addrs, 10*time.Minute)
 		go func(info peer.AddrInfo) {
 			ctx, cancel := context.WithTimeout(n.ctx, 5*time.Second)
@@ -1657,22 +1692,12 @@ func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
 }
 
 func (n *Node) addTrustedPeerAddrs(trusted model.TrustedPeer) {
-	id, err := peer.Decode(trusted.PeerID)
-	if err != nil {
+	info, ok := n.addrInfoForTrustedPeer(trusted)
+	if !ok || len(info.Addrs) == 0 {
 		return
 	}
-	var addrs []ma.Multiaddr
-	for _, raw := range trusted.Addrs {
-		addr, err := ma.NewMultiaddr(raw)
-		if err != nil {
-			continue
-		}
-		addrs = append(addrs, addr)
-	}
-	if len(addrs) == 0 {
-		return
-	}
-	n.host.Peerstore().AddAddrs(id, addrs, peerstore.PermanentAddrTTL)
+	n.prepareRelayPeer(info.ID)
+	n.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
 }
 
 func (n *Node) currentSwarm(swarmID string) *activeSwarm {
@@ -1717,12 +1742,142 @@ func (n *Node) emitNearbySnapshot() {
 	n.emit(Event{Kind: EventNearbySnapshot, NearbyPeers: nearby})
 }
 
+func configuredRelayFromEnv() (*configuredRelay, error) {
+	raw := strings.TrimSpace(os.Getenv("YAP_RELAY_ADDR"))
+	if raw == "" {
+		return nil, nil
+	}
+	info, err := peer.AddrInfoFromString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse YAP_RELAY_ADDR: %w", err)
+	}
+	if info == nil || info.ID == "" || len(info.Addrs) == 0 {
+		return nil, fmt.Errorf("YAP_RELAY_ADDR must include a relay peer id and at least one address")
+	}
+	return &configuredRelay{
+		Info: peer.AddrInfo{
+			ID:    info.ID,
+			Addrs: append([]ma.Multiaddr(nil), info.Addrs...),
+		},
+	}, nil
+}
+
+func (n *Node) relayLoop() {
+	if n.relay == nil {
+		return
+	}
+	for {
+		waitFor, err := n.refreshRelayReservation()
+		if err != nil {
+			n.setRelayAddrs(nil)
+			waitFor = relayRetryEvery
+		}
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(waitFor):
+		}
+	}
+}
+
+func (n *Node) refreshRelayReservation() (time.Duration, error) {
+	if n.relay == nil {
+		return relayRetryEvery, fmt.Errorf("relay is not configured")
+	}
+
+	n.prepareRelayPeer(n.relay.Info.ID)
+
+	ctx, cancel := context.WithTimeout(n.ctx, 20*time.Second)
+	defer cancel()
+
+	if err := n.host.Connect(ctx, n.relay.Info); err != nil {
+		return relayRetryEvery, fmt.Errorf("connect relay: %w", err)
+	}
+
+	reservation, err := relayclient.Reserve(ctx, n.host, n.relay.Info)
+	if err != nil {
+		return relayRetryEvery, fmt.Errorf("reserve relay slot: %w", err)
+	}
+
+	n.setRelayAddrs(sanitizePeerAddrs(multiaddrStrings(reservation.Addrs)))
+
+	refreshAfter := time.Until(reservation.Expiration) - relayRefreshLead
+	if refreshAfter < relayMinRefresh {
+		refreshAfter = relayMinRefresh
+	}
+	return refreshAfter, nil
+}
+
+func (n *Node) currentRelayAddrs() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return append([]string(nil), n.relayAddrs...)
+}
+
+func (n *Node) setRelayAddrs(addrs []string) {
+	n.mu.Lock()
+	n.relayAddrs = sanitizePeerAddrs(addrs)
+	n.mu.Unlock()
+}
+
+func (n *Node) prepareRelayPeer(target peer.ID) bool {
+	if n.relay == nil {
+		return false
+	}
+	n.host.Peerstore().AddAddrs(n.relay.Info.ID, n.relay.Info.Addrs, peerstore.PermanentAddrTTL)
+	if target == "" || target == n.relay.Info.ID {
+		return true
+	}
+	circuitAddrs := multiaddrsFromStrings(n.relayCircuitAddrs(target.String()))
+	if len(circuitAddrs) == 0 {
+		return false
+	}
+	n.host.Peerstore().AddAddrs(target, circuitAddrs, peerstore.PermanentAddrTTL)
+	return true
+}
+
+func (n *Node) relayCircuitAddrs(peerID string) []string {
+	if n.relay == nil || strings.TrimSpace(peerID) == "" || peerID == n.host.ID().String() {
+		return nil
+	}
+	relayComponent, err := ma.NewMultiaddr("/p2p/" + n.relay.Info.ID.String())
+	if err != nil {
+		return nil
+	}
+	circuitComponent, err := ma.NewMultiaddr("/p2p-circuit")
+	if err != nil {
+		return nil
+	}
+
+	out := make([]string, 0, len(n.relay.Info.Addrs))
+	for _, addr := range n.relay.Info.Addrs {
+		out = append(out, addr.Encapsulate(relayComponent).Encapsulate(circuitComponent).String())
+	}
+	return sanitizePeerAddrs(out)
+}
+
+func (n *Node) addrInfoForTrustedPeer(trusted model.TrustedPeer) (peer.AddrInfo, bool) {
+	id, err := peer.Decode(trusted.PeerID)
+	if err != nil {
+		return peer.AddrInfo{}, false
+	}
+	addrs := uniqueStrings(append(
+		sanitizePeerAddrs(trusted.Addrs),
+		n.relayCircuitAddrs(trusted.PeerID)...,
+	))
+	return peer.AddrInfo{ID: id, Addrs: multiaddrsFromStrings(addrs)}, true
+}
+
 func (n *Node) selfPeer() model.TrustedPeer {
+	addrs := uniqueStrings(append(
+		sanitizePeerAddrs(multiaddrStrings(n.host.Addrs())),
+		n.currentRelayAddrs()...,
+	))
 	return model.TrustedPeer{
 		PeerID:      n.host.ID().String(),
 		Name:        sanitizeDisplayName(n.identity.Name),
 		Fingerprint: n.identity.Fingerprint,
-		Addrs:       sanitizePeerAddrs(multiaddrStrings(n.host.Addrs())),
+		Addrs:       sanitizePeerAddrs(addrs),
 		LastSeen:    time.Now(),
 	}
 }
@@ -2098,6 +2253,18 @@ func multiaddrStrings(addrs []ma.Multiaddr) []string {
 	return out
 }
 
+func multiaddrsFromStrings(values []string) []ma.Multiaddr {
+	out := make([]ma.Multiaddr, 0, len(values))
+	for _, raw := range values {
+		addr, err := ma.NewMultiaddr(raw)
+		if err != nil {
+			continue
+		}
+		out = append(out, addr)
+	}
+	return out
+}
+
 func mergeAddrInfo(current, next peer.AddrInfo) peer.AddrInfo {
 	out := peer.AddrInfo{ID: next.ID}
 	if out.ID == "" {
@@ -2286,13 +2453,17 @@ func (n *Node) peerAddrs(peerID string) []string {
 		return nil
 	}
 	if peerID == n.host.ID().String() {
-		return sanitizePeerAddrs(multiaddrStrings(n.host.Addrs()))
+		return n.selfPeer().Addrs
 	}
 	decoded, err := peer.Decode(peerID)
 	if err != nil {
 		return nil
 	}
-	return sanitizePeerAddrs(multiaddrStrings(n.host.Peerstore().Addrs(decoded)))
+	addrs := uniqueStrings(append(
+		sanitizePeerAddrs(multiaddrStrings(n.host.Peerstore().Addrs(decoded))),
+		n.relayCircuitAddrs(peerID)...,
+	))
+	return sanitizePeerAddrs(addrs)
 }
 
 func boolPtr(value bool) *bool {

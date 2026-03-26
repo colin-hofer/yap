@@ -1,6 +1,6 @@
 # yap
 
-`yap` is a LAN-first peer-to-peer chat client written in Go. It uses a terminal UI for everyday use, libp2p for transport and discovery, and a room key shared through an explicit pairing flow.
+`yap` is a LAN-first peer-to-peer chat client written in Go. This repo also contains the `yap-relay` daemon and the blue/green deploy tool for publishing that relay to a public host.
 
 ## Install
 
@@ -59,6 +59,56 @@ Once installed, `yap update` downloads the latest GitHub release for your curren
 4. On another machine, run `yap`, select the nearby peer, press `j`, and enter the code.
 5. Approve pairing on both sides and start chatting.
 
+## WAN Relay
+
+`yap` can now pair and chat over a static libp2p relay.
+
+- Run the relay server with `go build ./cmd/yap-relay` and start the binary with:
+  - `SERVER_ADDR` for the local listener, for example `127.0.0.1:18081`
+  - `HEALTH_ADDR` for the local HTTP health server, for example `127.0.0.1:19081`
+  - `YAP_RELAY_PUBLIC_ADDR` for the public proxy address advertised to clients, for example `/dns4/relay.example.com/tcp/4001`
+- On each `yap` client, set `YAP_RELAY_ADDR` to the full public relay multiaddr including the relay peer ID, for example `/dns4/relay.example.com/tcp/4001/p2p/<relay-peer-id>`.
+- Invites now copy a share token like `Y1-<inviter-peer-id>-<code>`.
+  - With `YAP_RELAY_ADDR` configured, `yap join <invite>` dials the inviter through the relay.
+  - Without a relay, the same token still works on LAN if you select the inviter in the nearby list and paste the token.
+
+## Monorepo Tooling
+
+This repo now contains everything needed for the client, the relay, and relay deployment:
+
+- `./cmd/yap`: terminal chat client
+- `./cmd/yap-relay`: public libp2p relay daemon
+- `./cmd/deploy`: relay blue/green deploy command
+- `./deploy/relay.env`: deploy config for the relay host
+
+Build commands:
+
+```bash
+go build ./cmd/yap
+go build ./cmd/yap-relay
+go build ./cmd/deploy
+```
+
+Deploy the relay from the repo root:
+
+```bash
+go run ./cmd/deploy
+```
+
+The deploy command reads `deploy/relay.env` by default, builds `./cmd/yap-relay`, uploads it to the configured host, starts the inactive slot, validates `/healthz`, switches HAProxy on the public port, and then stops the previous slot.
+
+After the first deploy, read the active unit logs on the server to get the relay peer ID and final client dial address:
+
+```bash
+ssh root@104.236.76.237 'slot=$(cat /var/lib/yap-relay/active_slot); journalctl -u yap-relay-$slot.service -n 100 --no-pager'
+```
+
+Then set client machines to the full relay address:
+
+```bash
+export YAP_RELAY_ADDR='/dns4/colinhofer.com/tcp/4001/p2p/<relay-peer-id>'
+```
+
 ## Architecture
 
 The implementation follows a layered design:
@@ -84,7 +134,8 @@ The implementation follows a layered design:
 ```bash
 yap
 yap open <swarm-name-or-id>
-yap join <invite-code>
+yap join <invite>
+yap-relay
 yap update
 yap version
 ```

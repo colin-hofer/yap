@@ -14,6 +14,14 @@ import (
 
 var crockfordEncoding = base32.NewEncoding("0123456789ABCDEFGHJKMNPQRSTVWXYZ").WithPadding(base32.NoPadding)
 
+const inviteTokenVersion = "Y1"
+
+// InviteToken is a parsed shareable invite reference.
+type InviteToken struct {
+	PeerID string
+	Code   string
+}
+
 // RandomID returns a short random identifier suitable for transcripts and swarms.
 func RandomID(length int) (string, error) {
 	if length <= 0 {
@@ -38,6 +46,43 @@ func NormalizeInviteCode(raw string) string {
 	raw = strings.ReplaceAll(raw, "-", "")
 	raw = strings.ReplaceAll(raw, " ", "")
 	return raw
+}
+
+// FormatInviteToken renders a shareable invite token that carries the inviter peer identity.
+func FormatInviteToken(peerID, code string) string {
+	code = NormalizeInviteCode(code)
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return code
+	}
+	return inviteTokenVersion + "-" + peerID + "-" + code
+}
+
+// ParseInviteToken parses either a legacy short invite code or a versioned token.
+func ParseInviteToken(raw string) (InviteToken, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return InviteToken{}, fmt.Errorf("invite code cannot be empty")
+	}
+
+	if strings.HasPrefix(strings.ToUpper(raw), inviteTokenVersion+"-") {
+		parts := strings.SplitN(raw, "-", 3)
+		if len(parts) != 3 {
+			return InviteToken{}, fmt.Errorf("invalid invite token")
+		}
+		peerID := strings.TrimSpace(parts[1])
+		code := NormalizeInviteCode(parts[2])
+		if peerID == "" || code == "" {
+			return InviteToken{}, fmt.Errorf("invalid invite token")
+		}
+		return InviteToken{PeerID: peerID, Code: code}, nil
+	}
+
+	code := NormalizeInviteCode(raw)
+	if code == "" {
+		return InviteToken{}, fmt.Errorf("invite code cannot be empty")
+	}
+	return InviteToken{Code: code}, nil
 }
 
 // NewRoomKey returns a base64-encoded 32-byte room key.

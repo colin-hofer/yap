@@ -31,6 +31,7 @@ type NearbyPeer struct {
 // Invite stores a user-visible invite created for a swarm.
 type Invite struct {
 	Code       string    `json:"code"`
+	ShareToken string    `json:"share_token,omitempty"`
 	SwarmID    string    `json:"swarm_id"`
 	SwarmName  string    `json:"swarm_name"`
 	ExpiresAt  time.Time `json:"expires_at"`

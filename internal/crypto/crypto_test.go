@@ -46,3 +46,42 @@ func TestNormalizeInviteCode(t *testing.T) {
 		t.Fatalf("NormalizeInviteCode() = %q, want %q", got, want)
 	}
 }
+
+func TestFormatInviteToken(t *testing.T) {
+	got := FormatInviteToken("12D3KooWTestPeer", "abcd-1234")
+	if want := "Y1-12D3KooWTestPeer-ABCD1234"; got != want {
+		t.Fatalf("FormatInviteToken() = %q, want %q", got, want)
+	}
+}
+
+func TestParseInviteTokenVersioned(t *testing.T) {
+	token, err := ParseInviteToken("y1-12D3KooWTestPeer-abcd-1234")
+	if err != nil {
+		t.Fatalf("ParseInviteToken() error = %v", err)
+	}
+	if got, want := token.PeerID, "12D3KooWTestPeer"; got != want {
+		t.Fatalf("PeerID = %q, want %q", got, want)
+	}
+	if got, want := token.Code, "ABCD1234"; got != want {
+		t.Fatalf("Code = %q, want %q", got, want)
+	}
+}
+
+func TestParseInviteTokenLegacy(t *testing.T) {
+	token, err := ParseInviteToken(" abcd-1234 ")
+	if err != nil {
+		t.Fatalf("ParseInviteToken() error = %v", err)
+	}
+	if token.PeerID != "" {
+		t.Fatalf("PeerID = %q, want empty", token.PeerID)
+	}
+	if got, want := token.Code, "ABCD1234"; got != want {
+		t.Fatalf("Code = %q, want %q", got, want)
+	}
+}
+
+func TestParseInviteTokenRejectsInvalidVersionedFormat(t *testing.T) {
+	if _, err := ParseInviteToken("Y1--"); err == nil {
+		t.Fatal("ParseInviteToken() unexpectedly accepted invalid token")
+	}
+}

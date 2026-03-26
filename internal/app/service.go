@@ -87,14 +87,26 @@ type Service struct {
 
 	events chan Event
 
-	startupOpen   string
-	startupJoin   string
-	autoJoinTried map[string]struct{}
+	startupOpen       string
+	startupJoinToken  string
+	startupJoinCode   string
+	startupJoinPeerID string
+	autoJoinTried     map[string]struct{}
 }
 
 // New creates the app service and starts background event handling.
 func New(parent context.Context, opts Options) (*Service, error) {
 	ctx, cancel := context.WithCancel(parent)
+
+	var startupJoin yapcrypto.InviteToken
+	if strings.TrimSpace(opts.JoinCode) != "" {
+		var err error
+		startupJoin, err = yapcrypto.ParseInviteToken(opts.JoinCode)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 
 	root := opts.RootDir
 	if strings.TrimSpace(root) == "" {
@@ -129,23 +141,25 @@ func New(parent context.Context, opts Options) (*Service, error) {
 	}
 
 	svc := &Service{
-		ctx:           ctx,
-		cancel:        cancel,
-		store:         st,
-		node:          node,
-		identity:      identity,
-		swarms:        swarms,
-		nearby:        make(map[string]model.NearbyPeer),
-		transcripts:   make(map[string][]model.TranscriptEntry),
-		transcriptLag: make(map[string]int),
-		presence:      make(map[string][]model.Presence),
-		unread:        make(map[string]int),
-		connected:     make(map[string]bool),
-		lastActivity:  make(map[string]time.Time),
-		events:        make(chan Event, 256),
-		startupOpen:   strings.TrimSpace(opts.OpenSwarm),
-		startupJoin:   yapcrypto.NormalizeInviteCode(opts.JoinCode),
-		autoJoinTried: make(map[string]struct{}),
+		ctx:               ctx,
+		cancel:            cancel,
+		store:             st,
+		node:              node,
+		identity:          identity,
+		swarms:            swarms,
+		nearby:            make(map[string]model.NearbyPeer),
+		transcripts:       make(map[string][]model.TranscriptEntry),
+		transcriptLag:     make(map[string]int),
+		presence:          make(map[string][]model.Presence),
+		unread:            make(map[string]int),
+		connected:         make(map[string]bool),
+		lastActivity:      make(map[string]time.Time),
+		events:            make(chan Event, 256),
+		startupOpen:       strings.TrimSpace(opts.OpenSwarm),
+		startupJoinToken:  strings.TrimSpace(opts.JoinCode),
+		startupJoinCode:   startupJoin.Code,
+		startupJoinPeerID: strings.TrimSpace(startupJoin.PeerID),
+		autoJoinTried:     make(map[string]struct{}),
 	}
 
 	for _, swarm := range swarms {
@@ -179,8 +193,14 @@ func New(parent context.Context, opts Options) (*Service, error) {
 		if err := svc.OpenSwarm(svc.startupOpen); err != nil {
 			svc.emitToast(err.Error())
 		}
-	} else if svc.startupJoin != "" {
-		svc.emitToast(fmt.Sprintf("waiting for an inviter advertising code %s", svc.startupJoin))
+	} else if svc.startupJoinToken != "" {
+		if svc.startupJoinPeerID != "" {
+			if err := svc.StartJoin("", svc.startupJoinToken, true); err != nil {
+				svc.emitToast(fmt.Sprintf("waiting for inviter %s nearby: %v", svc.startupJoinPeerID, err))
+			}
+		} else {
+			svc.emitToast(fmt.Sprintf("waiting for an inviter advertising code %s", svc.startupJoinCode))
+		}
 	}
 	svc.emitSync()
 	return svc, nil
@@ -469,6 +489,29 @@ func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
 // StartPair begins pairing with a nearby peer.
 func (s *Service) StartPair(peerID, code string, autoOpen bool) error {
 	return s.node.PairWithPeer(peerID, code, autoOpen)
+}
+
+// StartJoin begins pairing from either a nearby invite code or a WAN invite token.
+func (s *Service) StartJoin(peerID, token string, autoOpen bool) error {
+	parsed, err := yapcrypto.ParseInviteToken(token)
+	if err != nil {
+		return err
+	}
+	if parsed.PeerID != "" {
+		if err := s.node.PairWithInviteToken(token, autoOpen); err == nil {
+			return nil
+		}
+		if strings.TrimSpace(peerID) == "" {
+			return fmt.Errorf("select the inviter nearby or configure YAP_RELAY_ADDR")
+		}
+		if peerID != parsed.PeerID {
+			return fmt.Errorf("selected nearby peer does not match the invite")
+		}
+	}
+	if strings.TrimSpace(peerID) == "" {
+		return fmt.Errorf("select a nearby peer first")
+	}
+	return s.node.PairWithPeer(peerID, parsed.Code, autoOpen)
 }
 
 // ResolveApproval answers a pending approval prompt.
@@ -826,8 +869,10 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		s.mu.Unlock()
 
 		s.emitToast(fmt.Sprintf("paired with %s and saved %s", displayName(result.Peer), swarm.Name))
-		if autoOpen || s.startupJoin != "" {
-			s.startupJoin = ""
+		if autoOpen || s.startupJoinToken != "" {
+			s.startupJoinToken = ""
+			s.startupJoinCode = ""
+			s.startupJoinPeerID = ""
 			if err := s.OpenSwarm(swarm.ID); err != nil {
 				s.emitToast(err.Error())
 			}
@@ -838,7 +883,7 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 }
 
 func (s *Service) maybeAutoJoin(peerID string) {
-	if s.startupJoin == "" {
+	if s.startupJoinCode == "" {
 		return
 	}
 	s.mu.RLock()
@@ -848,10 +893,13 @@ func (s *Service) maybeAutoJoin(peerID string) {
 	if tried || !ok {
 		return
 	}
+	if s.startupJoinPeerID != "" && peerID != s.startupJoinPeerID {
+		return
+	}
 	s.mu.Lock()
 	s.autoJoinTried[peerID] = struct{}{}
 	s.mu.Unlock()
-	if err := s.StartPair(peerID, s.startupJoin, true); err != nil {
+	if err := s.StartJoin(peerID, s.startupJoinToken, true); err != nil {
 		s.emitToast(err.Error())
 	}
 }
