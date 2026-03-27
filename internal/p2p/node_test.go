@@ -4,15 +4,32 @@ import (
 	"context"
 	"crypto/rand"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	libp2p "github.com/libp2p/go-libp2p"
 	corecrypto "github.com/libp2p/go-libp2p/core/crypto"
+	corehost "github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 
 	yapcrypto "yap/internal/crypto"
 	"yap/internal/model"
 )
+
+type blockingHost struct {
+	corehost.Host
+	addrsStarted chan struct{}
+	releaseAddrs chan struct{}
+	once         sync.Once
+}
+
+func (h *blockingHost) Addrs() []ma.Multiaddr {
+	h.once.Do(func() { close(h.addrsStarted) })
+	<-h.releaseAddrs
+	return h.Host.Addrs()
+}
 
 func TestListenAddrsDefaultsToTCP(t *testing.T) {
 	t.Setenv("YAP_TRANSPORT", "")
@@ -201,6 +218,83 @@ func TestRefreshNearbyPrunesExpiredPeersAndEmitsSnapshot(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected nearby snapshot event")
+	}
+}
+
+func TestEmitPresenceSnapshotDoesNotDeadlockWhenWriterQueues(t *testing.T) {
+	baseHost, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatalf("libp2p.New() error = %v", err)
+	}
+	defer baseHost.Close()
+
+	host := &blockingHost{
+		Host:         baseHost,
+		addrsStarted: make(chan struct{}),
+		releaseAddrs: make(chan struct{}),
+	}
+	node := &Node{
+		ctx:        context.Background(),
+		host:       host,
+		events:     make(chan Event, 1),
+		relayAddrs: []string{"/dns4/relay.example.com/tcp/4001/p2p-circuit"},
+	}
+	active := &activeSwarm{
+		Swarm: model.Swarm{ID: "swarm-1"},
+		Presence: map[string]*presenceRecord{
+			baseHost.ID().String(): {
+				PeerID:   baseHost.ID().String(),
+				Name:     "self",
+				State:    "online",
+				LastSeen: time.Now(),
+			},
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		node.emitPresenceSnapshot(active)
+		close(done)
+	}()
+
+	select {
+	case <-host.addrsStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emitPresenceSnapshot() never reached host.Addrs()")
+	}
+
+	writerDone := make(chan struct{})
+	go func() {
+		node.mu.Lock()
+		node.mu.Unlock()
+		close(writerDone)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	close(host.releaseAddrs)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emitPresenceSnapshot() deadlocked with queued writer")
+	}
+
+	select {
+	case event := <-node.events:
+		if event.Kind != EventPresence {
+			t.Fatalf("event.Kind = %q, want %q", event.Kind, EventPresence)
+		}
+		if got, want := len(event.Presence), 1; got != want {
+			t.Fatalf("len(event.Presence) = %d, want %d", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected presence event")
+	}
+
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer remained blocked after snapshot")
 	}
 }
 

@@ -1669,8 +1669,18 @@ func (n *Node) refreshPresence(active *activeSwarm) {
 func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
 	n.mu.RLock()
 	now := time.Now()
-	presence := make([]model.Presence, 0, len(active.Presence))
+	swarmID := active.Swarm.ID
+	records := make([]presenceRecord, 0, len(active.Presence))
 	for _, record := range active.Presence {
+		if record == nil {
+			continue
+		}
+		records = append(records, *record)
+	}
+	n.mu.RUnlock()
+
+	presence := make([]model.Presence, 0, len(records))
+	for _, record := range records {
 		presence = append(presence, model.Presence{
 			PeerID:      record.PeerID,
 			Name:        record.Name,
@@ -1681,14 +1691,13 @@ func (n *Node) emitPresenceSnapshot(active *activeSwarm) {
 			LastSeen:    record.LastSeen,
 		})
 	}
-	n.mu.RUnlock()
 	sort.Slice(presence, func(i, j int) bool {
 		if presence[i].State == presence[j].State {
 			return strings.ToLower(presence[i].Name) < strings.ToLower(presence[j].Name)
 		}
 		return presenceRank(presence[i].State) < presenceRank(presence[j].State)
 	})
-	n.emit(Event{Kind: EventPresence, SwarmID: active.Swarm.ID, Presence: presence})
+	n.emit(Event{Kind: EventPresence, SwarmID: swarmID, Presence: presence})
 }
 
 func (n *Node) addTrustedPeerAddrs(trusted model.TrustedPeer) {
