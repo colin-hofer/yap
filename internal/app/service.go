@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	yapcrypto "yap/internal/crypto"
+	"yap/internal/debuglog"
 	"yap/internal/model"
 	"yap/internal/p2p"
 	"yap/internal/store"
@@ -97,12 +98,18 @@ type Service struct {
 // New creates the app service and starts background event handling.
 func New(parent context.Context, opts Options) (*Service, error) {
 	ctx, cancel := context.WithCancel(parent)
+	debuglog.Info("service initializing",
+		"root", strings.TrimSpace(opts.RootDir),
+		"open_swarm", strings.TrimSpace(opts.OpenSwarm),
+		"join_mode", debugJoinMode(opts.JoinCode),
+	)
 
 	var startupJoin yapcrypto.InviteToken
 	if strings.TrimSpace(opts.JoinCode) != "" {
 		var err error
 		startupJoin, err = yapcrypto.ParseInviteToken(opts.JoinCode)
 		if err != nil {
+			debuglog.Error("startup join token parse failed", "error", err.Error())
 			cancel()
 			return nil, err
 		}
@@ -114,24 +121,28 @@ func New(parent context.Context, opts Options) (*Service, error) {
 	}
 	st := store.New(root)
 	if err := st.Ensure(); err != nil {
+		debuglog.Error("state store initialization failed", "root", root, "error", err.Error())
 		cancel()
 		return nil, err
 	}
 
 	identity, err := loadOrCreateIdentity(st)
 	if err != nil {
+		debuglog.Error("identity load failed", "error", err.Error())
 		cancel()
 		return nil, err
 	}
 
 	node, err := p2p.New(ctx, identity, st)
 	if err != nil {
+		debuglog.Error("p2p node initialization failed", "peer_id", identity.PeerID, "error", err.Error())
 		cancel()
 		return nil, err
 	}
 
 	swarms, err := st.ListSwarms()
 	if err != nil {
+		debuglog.Error("list swarms failed", "error", err.Error())
 		node.Close()
 		cancel()
 		return nil, err
@@ -165,6 +176,7 @@ func New(parent context.Context, opts Options) (*Service, error) {
 	for _, swarm := range swarms {
 		transcript, err := st.LoadTranscript(swarm.ID)
 		if err != nil {
+			debuglog.Error("load transcript failed", "swarm_id", swarm.ID, "error", err.Error())
 			node.Close()
 			cancel()
 			return nil, err
@@ -181,6 +193,7 @@ func New(parent context.Context, opts Options) (*Service, error) {
 
 	for _, swarm := range swarms {
 		if err := svc.node.OpenSwarm(swarm); err != nil {
+			debuglog.Warn("failed to reconnect saved swarm", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "error", err.Error())
 			svc.emitToast(fmt.Sprintf("failed to connect %s: %v", swarm.Name, err))
 			continue
 		}
@@ -191,17 +204,20 @@ func New(parent context.Context, opts Options) (*Service, error) {
 
 	if svc.startupOpen != "" {
 		if err := svc.OpenSwarm(svc.startupOpen); err != nil {
+			debuglog.Warn("startup open failed", "swarm_ref", svc.startupOpen, "error", err.Error())
 			svc.emitToast(err.Error())
 		}
 	} else if svc.startupJoinToken != "" {
 		if svc.startupJoinPeerID != "" {
 			if err := svc.StartJoin("", svc.startupJoinToken, true); err != nil {
+				debuglog.Warn("startup join deferred to nearby fallback", "inviter_peer", svc.startupJoinPeerID, "error", err.Error())
 				svc.emitToast(fmt.Sprintf("waiting for inviter %s nearby: %v", svc.startupJoinPeerID, err))
 			}
 		} else {
 			svc.emitToast(fmt.Sprintf("waiting for an inviter advertising code %s", svc.startupJoinCode))
 		}
 	}
+	debuglog.Info("service ready", "peer_id", identity.PeerID, "swarms", len(swarms), "nearby", len(svc.nearby))
 	svc.emitSync()
 	return svc, nil
 }
@@ -261,6 +277,7 @@ func (s *Service) CreateSwarm(name string) (model.Swarm, error) {
 		return model.Swarm{}, err
 	}
 	s.mu.Unlock()
+	debuglog.Info("swarm created", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "owner_peer", swarm.OwnerPeerID)
 	s.emitSync()
 	return swarm, nil
 }
@@ -271,6 +288,7 @@ func (s *Service) RenameIdentity(name string) error {
 	if name == "" {
 		return fmt.Errorf("name cannot be empty")
 	}
+	debuglog.Info("identity rename requested", "new_name", name)
 
 	s.mu.RLock()
 	identity := s.identity
@@ -305,26 +323,33 @@ func (s *Service) RenameIdentity(name string) error {
 	s.identity = identity
 	s.swarms = updatedSwarms
 	s.mu.Unlock()
+	debuglog.Info("identity renamed", "peer_id", identity.PeerID, "new_name", identity.Name)
 	s.emitSync()
 	return nil
 }
 
 // OpenSwarm selects a swarm and ensures it is connected in the background.
 func (s *Service) OpenSwarm(ref string) error {
+	debuglog.Info("open swarm requested", "ref", strings.TrimSpace(ref))
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
+		debuglog.Warn("open swarm failed", "ref", strings.TrimSpace(ref), "error", err.Error())
 		return err
 	}
 	swarm = normalizeSwarmMetadata(swarm)
 	if swarm.Revoked {
-		return fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
+		err := fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
+		debuglog.Warn("open swarm rejected", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "error", err.Error())
+		return err
 	}
 	swarm.LastOpened = time.Now()
 	swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 	if err := s.store.SaveSwarm(swarm); err != nil {
+		debuglog.Error("open swarm save failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	if err := s.node.OpenSwarm(swarm); err != nil {
+		debuglog.Error("open swarm connect failed", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "error", err.Error())
 		return err
 	}
 
@@ -336,15 +361,18 @@ func (s *Service) OpenSwarm(ref string) error {
 		transcript, err := s.store.LoadTranscript(swarm.ID)
 		if err != nil {
 			s.mu.Unlock()
+			debuglog.Error("open swarm transcript load failed", "swarm_id", swarm.ID, "error", err.Error())
 			return err
 		}
 		s.transcripts[swarm.ID] = transcript
 	}
 	if err := s.reloadSwarmsLocked(); err != nil {
 		s.mu.Unlock()
+		debuglog.Error("open swarm reload failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	s.mu.Unlock()
+	debuglog.Info("swarm opened", "swarm_id", swarm.ID, "swarm_name", swarm.Name)
 	s.emitSync()
 	return nil
 }
@@ -353,25 +381,32 @@ func (s *Service) OpenSwarm(ref string) error {
 func (s *Service) LeaveSwarm() error {
 	_ = s.markSelectedSwarmRead(time.Now())
 	s.mu.Lock()
+	selectedID := s.selectedID
 	s.selectedID = ""
 	s.mu.Unlock()
+	debuglog.Info("swarm left", "swarm_id", selectedID)
 	s.emitSync()
 	return nil
 }
 
 // RemoveSwarm forgets a saved swarm locally and deletes its transcript.
 func (s *Service) RemoveSwarm(ref string) error {
+	debuglog.Info("remove swarm requested", "ref", strings.TrimSpace(ref))
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
+		debuglog.Warn("remove swarm failed", "ref", strings.TrimSpace(ref), "error", err.Error())
 		return err
 	}
 	if err := s.node.CloseSwarm(swarm.ID); err != nil {
+		debuglog.Error("remove swarm close failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	if err := s.store.DeleteTranscript(swarm.ID); err != nil {
+		debuglog.Error("remove swarm transcript delete failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	if err := s.store.DeleteSwarm(swarm.ID); err != nil {
+		debuglog.Error("remove swarm save delete failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 
@@ -387,9 +422,11 @@ func (s *Service) RemoveSwarm(ref string) error {
 	}
 	if err := s.reloadSwarmsLocked(); err != nil {
 		s.mu.Unlock()
+		debuglog.Error("remove swarm reload failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	s.mu.Unlock()
+	debuglog.Info("swarm removed", "swarm_id", swarm.ID, "swarm_name", swarm.Name)
 	s.emitSync()
 	return nil
 }
@@ -397,21 +434,28 @@ func (s *Service) RemoveSwarm(ref string) error {
 // RotateRoomKey rotates the shared room key while keeping the same saved swarm.
 // Only the swarm owner can rotate the room key for the room.
 func (s *Service) RotateRoomKey(ref string) error {
+	debuglog.Info("room key rotation requested", "ref", strings.TrimSpace(ref))
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
+		debuglog.Warn("room key rotation failed", "ref", strings.TrimSpace(ref), "error", err.Error())
 		return err
 	}
 	if swarm.Revoked {
-		return fmt.Errorf("access to %s was revoked", swarm.Name)
+		err := fmt.Errorf("access to %s was revoked", swarm.Name)
+		debuglog.Warn("room key rotation rejected", "swarm_id", swarm.ID, "error", err.Error())
+		return err
 	}
 	updated, _, err := prepareSwarmRotation(swarm, s.node.Self(), "")
 	if err != nil {
+		debuglog.Warn("room key rotation prepare failed", "swarm_id", swarm.ID, "error", err.Error())
 		return err
 	}
 	if err := s.store.SaveSwarm(updated); err != nil {
+		debuglog.Error("room key rotation save failed", "swarm_id", updated.ID, "error", err.Error())
 		return err
 	}
 	if err := s.node.OpenSwarm(updated); err != nil {
+		debuglog.Error("room key rotation reopen failed", "swarm_id", updated.ID, "error", err.Error())
 		return err
 	}
 	s.node.BroadcastSwarmUpdate(updated, "rotate", nil)
@@ -423,6 +467,7 @@ func (s *Service) RotateRoomKey(ref string) error {
 	s.mu.Unlock()
 
 	s.appendLocalSystemEntry(updated.ID, "Rotated the room key.")
+	debuglog.Info("room key rotated", "swarm_id", updated.ID, "swarm_name", updated.Name, "version", updated.Version)
 	s.emitToast(fmt.Sprintf("rotated the room key for %s", updated.Name))
 	s.emitSync()
 	return nil
@@ -431,21 +476,28 @@ func (s *Service) RotateRoomKey(ref string) error {
 // RevokePeer removes a trusted member from a swarm and rotates the room key so
 // the removed peer can no longer decrypt future traffic.
 func (s *Service) RevokePeer(ref, peerID string) error {
+	debuglog.Info("peer revocation requested", "ref", strings.TrimSpace(ref), "peer_id", peerID)
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
+		debuglog.Warn("peer revocation failed", "ref", strings.TrimSpace(ref), "peer_id", peerID, "error", err.Error())
 		return err
 	}
 	if swarm.Revoked {
-		return fmt.Errorf("access to %s was revoked", swarm.Name)
+		err := fmt.Errorf("access to %s was revoked", swarm.Name)
+		debuglog.Warn("peer revocation rejected", "swarm_id", swarm.ID, "error", err.Error())
+		return err
 	}
 	updated, removed, err := prepareSwarmRotation(swarm, s.node.Self(), peerID)
 	if err != nil {
+		debuglog.Warn("peer revocation prepare failed", "swarm_id", swarm.ID, "peer_id", peerID, "error", err.Error())
 		return err
 	}
 	if err := s.store.SaveSwarm(updated); err != nil {
+		debuglog.Error("peer revocation save failed", "swarm_id", updated.ID, "error", err.Error())
 		return err
 	}
 	if err := s.node.OpenSwarm(updated); err != nil {
+		debuglog.Error("peer revocation reopen failed", "swarm_id", updated.ID, "error", err.Error())
 		return err
 	}
 	s.node.BroadcastSwarmUpdate(updated, "revoke", removed)
@@ -457,6 +509,7 @@ func (s *Service) RevokePeer(ref, peerID string) error {
 	s.mu.Unlock()
 
 	s.appendLocalSystemEntry(updated.ID, fmt.Sprintf("Removed %s and rotated the room key.", displayName(*removed)))
+	debuglog.Info("peer revoked", "swarm_id", updated.ID, "swarm_name", updated.Name, "peer_id", removed.PeerID, "peer_name", displayName(*removed), "version", updated.Version)
 	s.emitToast(fmt.Sprintf("removed %s from %s", displayName(*removed), updated.Name))
 	s.emitSync()
 	return nil
@@ -464,21 +517,34 @@ func (s *Service) RevokePeer(ref, peerID string) error {
 
 // GenerateInvite creates a new invite for a swarm and notifies the UI.
 func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
+	debuglog.Info("invite generation requested", "ref", strings.TrimSpace(ref))
 	swarm, err := s.findSwarm(ref)
 	if err != nil {
+		debuglog.Warn("invite generation failed", "ref", strings.TrimSpace(ref), "error", err.Error())
 		return model.Invite{}, err
 	}
 	swarm = normalizeSwarmMetadata(swarm)
 	if swarm.Revoked {
-		return model.Invite{}, fmt.Errorf("access to %s was revoked", swarm.Name)
+		err := fmt.Errorf("access to %s was revoked", swarm.Name)
+		debuglog.Warn("invite generation rejected", "swarm_id", swarm.ID, "error", err.Error())
+		return model.Invite{}, err
 	}
 	if !swarmOwnedBy(swarm, s.identity.PeerID) {
-		return model.Invite{}, fmt.Errorf("only the room owner can invite new members")
+		err := fmt.Errorf("only the room owner can invite new members")
+		debuglog.Warn("invite generation rejected", "swarm_id", swarm.ID, "peer_id", s.identity.PeerID, "error", err.Error())
+		return model.Invite{}, err
 	}
 	invite, err := s.node.CreateInvite(swarm)
 	if err != nil {
+		debuglog.Error("invite generation failed", "swarm_id", swarm.ID, "error", err.Error())
 		return model.Invite{}, err
 	}
+	debuglog.Info("invite generated",
+		"swarm_id", invite.SwarmID,
+		"swarm_name", invite.SwarmName,
+		"invite_code", debugInviteCode(invite.Code),
+		"share_token", debugJoinMode(invite.ShareToken),
+	)
 	select {
 	case s.events <- Event{Type: EventInvite, Invite: &invite, Snapshot: s.nextSnapshot()}:
 	case <-s.ctx.Done():
@@ -488,6 +554,7 @@ func (s *Service) GenerateInvite(ref string) (model.Invite, error) {
 
 // StartPair begins pairing with a nearby peer.
 func (s *Service) StartPair(peerID, code string, autoOpen bool) error {
+	debuglog.Info("pairing requested", "peer_id", peerID, "invite_code", debugInviteCode(code), "auto_open", autoOpen)
 	return s.node.PairWithPeer(peerID, code, autoOpen)
 }
 
@@ -495,27 +562,43 @@ func (s *Service) StartPair(peerID, code string, autoOpen bool) error {
 func (s *Service) StartJoin(peerID, token string, autoOpen bool) error {
 	parsed, err := yapcrypto.ParseInviteToken(token)
 	if err != nil {
+		debuglog.Warn("join parse failed", "error", err.Error())
 		return err
 	}
+	debuglog.Info("join requested",
+		"selected_peer", peerID,
+		"join_mode", debugJoinMode(token),
+		"invite_code", debugInviteCode(parsed.Code),
+		"auto_open", autoOpen,
+	)
 	if parsed.PeerID != "" {
 		if err := s.node.PairWithInviteToken(token, autoOpen); err == nil {
+			debuglog.Info("join using relay token", "inviter_peer", parsed.PeerID)
 			return nil
 		}
 		if strings.TrimSpace(peerID) == "" {
-			return fmt.Errorf("select the inviter nearby or configure YAP_RELAY_ADDR")
+			err := fmt.Errorf("select the inviter nearby or configure YAP_RELAY_ADDR")
+			debuglog.Warn("join relay path unavailable", "inviter_peer", parsed.PeerID, "error", err.Error())
+			return err
 		}
 		if peerID != parsed.PeerID {
-			return fmt.Errorf("selected nearby peer does not match the invite")
+			err := fmt.Errorf("selected nearby peer does not match the invite")
+			debuglog.Warn("join nearby fallback rejected", "selected_peer", peerID, "inviter_peer", parsed.PeerID, "error", err.Error())
+			return err
 		}
 	}
 	if strings.TrimSpace(peerID) == "" {
-		return fmt.Errorf("select a nearby peer first")
+		err := fmt.Errorf("select a nearby peer first")
+		debuglog.Warn("join nearby path unavailable", "error", err.Error())
+		return err
 	}
+	debuglog.Info("join using nearby fallback", "peer_id", peerID)
 	return s.node.PairWithPeer(peerID, parsed.Code, autoOpen)
 }
 
 // ResolveApproval answers a pending approval prompt.
 func (s *Service) ResolveApproval(id string, accept bool) error {
+	debuglog.Info("pair approval resolved", "approval_id", id, "accept", accept)
 	return s.node.ResolveApproval(id, accept)
 }
 
@@ -525,15 +608,21 @@ func (s *Service) SendChat(body string) error {
 	selectedID := s.selectedID
 	s.mu.RUnlock()
 	if strings.TrimSpace(selectedID) == "" {
-		return fmt.Errorf("no swarm selected")
+		err := fmt.Errorf("no swarm selected")
+		debuglog.Warn("send chat rejected", "error", err.Error())
+		return err
 	}
 	swarm, err := s.findSwarm(selectedID)
 	if err != nil {
+		debuglog.Warn("send chat failed", "swarm_id", selectedID, "error", err.Error())
 		return err
 	}
 	if swarm.Revoked {
-		return fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
+		err := fmt.Errorf("access to %s was revoked; ask the room owner to invite you back", swarm.Name)
+		debuglog.Warn("send chat rejected", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "error", err.Error())
+		return err
 	}
+	debuglog.Info("send chat requested", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "body_bytes", len(strings.TrimSpace(body)))
 	return s.node.PublishChat(selectedID, body)
 }
 
@@ -550,9 +639,16 @@ func (s *Service) NotifyTyping(active bool) {
 
 // Shutdown stops background work and closes the node.
 func (s *Service) Shutdown() error {
+	debuglog.Info("service shutdown requested")
 	_ = s.markSelectedSwarmRead(time.Now())
 	s.cancel()
-	return s.node.Close()
+	err := s.node.Close()
+	if err != nil {
+		debuglog.Error("service shutdown failed", "error", err.Error())
+		return err
+	}
+	debuglog.Info("service shutdown complete")
+	return nil
 }
 
 func (s *Service) consumeNodeEvents() {
@@ -581,6 +677,7 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		s.emitSync()
 	case p2p.EventSystem:
 		if event.Message != "" {
+			debuglog.Warn("node system event", "message", event.Message)
 			s.emitToast(event.Message)
 		}
 	case p2p.EventApproval:
@@ -596,6 +693,7 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		if event.Pair == nil {
 			return
 		}
+		debuglog.Info("pair complete event", "direction", event.Pair.Direction, "swarm_id", event.Pair.Swarm.ID, "peer_id", event.Pair.Peer.PeerID, "auto_open", event.AutoOpen)
 		s.handlePairComplete(*event.Pair, event.AutoOpen)
 	case p2p.EventTranscript:
 		if event.Entry != nil {
@@ -607,10 +705,12 @@ func (s *Service) handleNodeEvent(event p2p.Event) {
 		s.handlePresenceEvent(event.SwarmID, event.Presence)
 	case p2p.EventSwarmUpdate:
 		if event.SwarmUpdate != nil {
+			debuglog.Info("swarm update event", "swarm_id", event.SwarmUpdate.Swarm.ID, "reason", event.SwarmUpdate.Reason, "actor_peer", event.SwarmUpdate.Actor.PeerID)
 			s.handleSwarmUpdate(*event.SwarmUpdate)
 		}
 	case p2p.EventSwarmRevoked:
 		if event.Revocation != nil {
+			debuglog.Warn("swarm revocation event", "swarm_id", event.Revocation.SwarmID, "actor_peer", event.Revocation.Actor.PeerID)
 			s.handleSwarmRevocation(*event.Revocation)
 		}
 	}
@@ -653,8 +753,18 @@ func (s *Service) handleTranscriptEvent(entry model.TranscriptEntry, persist boo
 			err = s.store.AppendTranscript(entry.SwarmID, entry)
 		}
 		if err != nil {
+			debuglog.Error("transcript persistence failed", "swarm_id", entry.SwarmID, "entry_kind", entry.Kind, "error", err.Error())
 			s.emitToast(err.Error())
 		}
+	}
+	if len(added) > 0 && entry.Kind == "chat" {
+		debuglog.Info("transcript entry processed",
+			"swarm_id", entry.SwarmID,
+			"entry_kind", entry.Kind,
+			"sender_peer", entry.SenderPeerID,
+			"local", entry.Local,
+			"body_bytes", len(entry.Body),
+		)
 	}
 	if !selected && swarmName != "" {
 		switch entry.Kind {
@@ -740,6 +850,9 @@ func (s *Service) handlePresenceEvent(swarmID string, presence []model.Presence)
 	if updated {
 		_ = s.store.SaveSwarm(swarm)
 	}
+	if updated {
+		debuglog.Info("presence updated peer metadata", "swarm_id", swarmID, "peers", len(presence))
+	}
 	s.emitSync()
 }
 
@@ -759,10 +872,12 @@ func (s *Service) handleSwarmUpdate(update p2p.SwarmUpdate) {
 	}
 
 	if err := s.store.SaveSwarm(swarm); err != nil {
+		debuglog.Error("swarm update save failed", "swarm_id", swarm.ID, "error", err.Error())
 		s.emitToast(err.Error())
 		return
 	}
 	if err := s.node.OpenSwarm(swarm); err != nil {
+		debuglog.Warn("swarm update reopen failed", "swarm_id", swarm.ID, "error", err.Error())
 		s.emitToast(err.Error())
 	}
 
@@ -778,6 +893,7 @@ func (s *Service) handleSwarmUpdate(update p2p.SwarmUpdate) {
 	if toastMessage, _ := swarmUpdateMessages(update, current.Name); strings.TrimSpace(toastMessage) != "" {
 		s.emitToast(toastMessage)
 	}
+	debuglog.Info("swarm update applied", "swarm_id", swarm.ID, "reason", update.Reason, "version", swarm.Version)
 	s.emitSync()
 }
 
@@ -793,9 +909,11 @@ func (s *Service) handleSwarmRevocation(revocation p2p.SwarmRevocation) {
 		swarm.Version = revocation.Version
 	}
 	if err := s.node.CloseSwarm(swarm.ID); err != nil {
+		debuglog.Warn("swarm revocation close failed", "swarm_id", swarm.ID, "error", err.Error())
 		s.emitToast(err.Error())
 	}
 	if err := s.store.SaveSwarm(swarm); err != nil {
+		debuglog.Error("swarm revocation save failed", "swarm_id", swarm.ID, "error", err.Error())
 		s.emitToast(err.Error())
 		return
 	}
@@ -810,6 +928,7 @@ func (s *Service) handleSwarmRevocation(revocation p2p.SwarmRevocation) {
 	s.mu.Unlock()
 
 	message := fmt.Sprintf("%s removed you from %s", displayName(revocation.Actor), swarm.Name)
+	debuglog.Warn("swarm revoked", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "actor_peer", revocation.Actor.PeerID)
 	s.appendLocalSystemEntry(swarm.ID, message+".")
 	s.emitToast(message)
 	s.emitSync()
@@ -824,10 +943,12 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, result.Peer)
 		if err := s.store.SaveSwarm(swarm); err != nil {
+			debuglog.Error("incoming pair save failed", "swarm_id", swarm.ID, "error", err.Error())
 			s.emitToast(err.Error())
 			return
 		}
 		if err := s.node.OpenSwarm(swarm); err != nil {
+			debuglog.Warn("incoming pair open failed", "swarm_id", swarm.ID, "error", err.Error())
 			s.emitToast(err.Error())
 		}
 		s.node.BroadcastSwarmUpdate(swarm, "join", &result.Peer)
@@ -836,6 +957,7 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		s.replaceSwarmLocked(swarm)
 		s.mu.Unlock()
 		s.emitToast(fmt.Sprintf("%s joined %s", displayName(result.Peer), swarm.Name))
+		debuglog.Info("incoming pair applied", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "peer_id", result.Peer.PeerID)
 		s.emitSync()
 	case "outgoing":
 		swarm := normalizeSwarmMetadata(result.Swarm)
@@ -848,10 +970,12 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		swarm.TrustedPeers = mergeTrustedPeer(swarm.TrustedPeers, s.node.Self())
 		swarm.LastOpened = time.Now()
 		if err := s.store.SaveSwarm(swarm); err != nil {
+			debuglog.Error("outgoing pair save failed", "swarm_id", swarm.ID, "error", err.Error())
 			s.emitToast(err.Error())
 			return
 		}
 		if err := s.node.OpenSwarm(swarm); err != nil {
+			debuglog.Warn("outgoing pair open failed", "swarm_id", swarm.ID, "error", err.Error())
 			s.emitToast(err.Error())
 		}
 
@@ -869,11 +993,13 @@ func (s *Service) handlePairComplete(result p2p.PairResult, autoOpen bool) {
 		s.mu.Unlock()
 
 		s.emitToast(fmt.Sprintf("paired with %s and saved %s", displayName(result.Peer), swarm.Name))
+		debuglog.Info("outgoing pair applied", "swarm_id", swarm.ID, "swarm_name", swarm.Name, "peer_id", result.Peer.PeerID, "auto_open", autoOpen)
 		if autoOpen || s.startupJoinToken != "" {
 			s.startupJoinToken = ""
 			s.startupJoinCode = ""
 			s.startupJoinPeerID = ""
 			if err := s.OpenSwarm(swarm.ID); err != nil {
+				debuglog.Warn("auto-open after pairing failed", "swarm_id", swarm.ID, "error", err.Error())
 				s.emitToast(err.Error())
 			}
 			return
@@ -899,7 +1025,9 @@ func (s *Service) maybeAutoJoin(peerID string) {
 	s.mu.Lock()
 	s.autoJoinTried[peerID] = struct{}{}
 	s.mu.Unlock()
+	debuglog.Info("auto-join attempting nearby peer", "peer_id", peerID, "join_mode", debugJoinMode(s.startupJoinToken))
 	if err := s.StartJoin(peerID, s.startupJoinToken, true); err != nil {
+		debuglog.Warn("auto-join failed", "peer_id", peerID, "error", err.Error())
 		s.emitToast(err.Error())
 	}
 }
@@ -1587,4 +1715,30 @@ func stringSlicesEqual(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func debugInviteCode(code string) string {
+	code = yapcrypto.NormalizeInviteCode(code)
+	if code == "" {
+		return "none"
+	}
+	if len(code) <= 4 {
+		return code
+	}
+	return code[:4] + "..."
+}
+
+func debugJoinMode(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "none"
+	}
+	token, err := yapcrypto.ParseInviteToken(raw)
+	if err != nil {
+		return "invalid"
+	}
+	if token.PeerID != "" {
+		return fmt.Sprintf("relay peer=%s code=%s", token.PeerID, debugInviteCode(token.Code))
+	}
+	return fmt.Sprintf("nearby code=%s", debugInviteCode(token.Code))
 }

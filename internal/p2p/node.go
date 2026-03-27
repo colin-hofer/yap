@@ -1751,26 +1751,6 @@ func (n *Node) emitNearbySnapshot() {
 	n.emit(Event{Kind: EventNearbySnapshot, NearbyPeers: nearby})
 }
 
-func configuredRelayFromEnv() (*configuredRelay, error) {
-	raw := strings.TrimSpace(os.Getenv("YAP_RELAY_ADDR"))
-	if raw == "" {
-		return nil, nil
-	}
-	info, err := peer.AddrInfoFromString(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse YAP_RELAY_ADDR: %w", err)
-	}
-	if info == nil || info.ID == "" || len(info.Addrs) == 0 {
-		return nil, fmt.Errorf("YAP_RELAY_ADDR must include a relay peer id and at least one address")
-	}
-	return &configuredRelay{
-		Info: peer.AddrInfo{
-			ID:    info.ID,
-			Addrs: append([]ma.Multiaddr(nil), info.Addrs...),
-		},
-	}, nil
-}
-
 func (n *Node) relayLoop() {
 	if n.relay == nil {
 		return

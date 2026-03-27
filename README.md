@@ -67,9 +67,12 @@ Once installed, `yap update` downloads the latest GitHub release for your curren
   - `SERVER_ADDR` for the local listener, for example `127.0.0.1:18081`
   - `HEALTH_ADDR` for the local HTTP health server, for example `127.0.0.1:19081`
   - `YAP_RELAY_PUBLIC_ADDR` for the public proxy address advertised to clients, for example `/dns4/relay.example.com/tcp/4001`
-- On each `yap` client, set `YAP_RELAY_ADDR` to the full public relay multiaddr including the relay peer ID, for example `/dns4/relay.example.com/tcp/4001/p2p/<relay-peer-id>`.
+- `yap` now defaults to this repo's deployed relay at `/dns4/colinhofer.com/tcp/4001`.
+- `YAP_RELAY_ADDR` is optional and can override the default relay.
+  - It accepts either the full public relay multiaddr including the relay peer ID, for example `/dns4/relay.example.com/tcp/4001/p2p/<relay-peer-id>`.
+  - Or just the bare public relay multiaddr, for example `/dns4/relay.example.com/tcp/4001`; `yap` will discover the relay peer ID at runtime.
 - Invites now copy a share token like `Y1-<inviter-peer-id>-<code>`.
-  - With `YAP_RELAY_ADDR` configured, `yap join <invite>` dials the inviter through the relay.
+  - By default, `yap join <invite>` dials the inviter through the deployed relay.
   - Without a relay, the same token still works on LAN if you select the inviter in the nearby list and paste the token.
 
 ## Monorepo Tooling
@@ -103,7 +106,7 @@ After the first deploy, read the active unit logs on the server to get the relay
 ssh root@104.236.76.237 'slot=$(cat /var/lib/yap-relay/active_slot); journalctl -u yap-relay-$slot.service -n 100 --no-pager'
 ```
 
-Then set client machines to the full relay address:
+If you need to override the built-in relay, set client machines to the full relay address:
 
 ```bash
 export YAP_RELAY_ADDR='/dns4/colinhofer.com/tcp/4001/p2p/<relay-peer-id>'
@@ -133,11 +136,30 @@ The implementation follows a layered design:
 
 ```bash
 yap
+yap --debug
 yap open <swarm-name-or-id>
+yap --debug join <invite>
 yap join <invite>
 yap-relay
 yap update
 yap version
+```
+
+## Debug Logging
+
+Run the client with `--debug` to write structured logs to `debug.log` in the same state directory that stores your identity, swarms, and transcripts.
+
+Examples:
+
+```bash
+yap --debug
+yap --debug join '<invite>'
+```
+
+On Linux the default path is usually:
+
+```bash
+~/.local/state/yap/debug.log
 ```
 
 ## Home Screen Controls
